@@ -336,31 +336,58 @@ static int print_battery_sensors(void)
 static void usage(void)
 {
     printf("batinfo - battery status for PowerPC Macs (10.4/10.5)\n\n"
-           "usage: batinfo [-h]\n"
+           "usage: batinfo [-w SECONDS] [-h]\n"
+           "  -w N  watch mode: refresh every N seconds\n"
            "  -h    this help\n");
 }
 
-int main(int argc, char **argv)
+/* one full snapshot; returns 0 if nothing battery-like was found */
+static int snapshot(void)
 {
-    int ch, pmu, sb;
+    int pmu, sb;
 
-    while ((ch = getopt(argc, argv, "h")) != -1) {
-        switch (ch) {
-        case 'h': usage(); return 0;
-        default:  usage(); return 1;
-        }
-    }
-
-    printf("batinfo (PowerPC Mac OS X 10.4/10.5, public IOKit registry)\n\n");
+    printf("batinfo (PowerPC Mac OS X 10.4/10.5, public IOKit registry)\n"
+           "press Ctrl-C to exit watch mode\n\n");
 
     pmu = print_pmu_batteries();
     sb  = print_smart_batteries();
     print_battery_sensors();
 
-    if (pmu + sb == 0) {
+    return pmu + sb;
+}
+
+int main(int argc, char **argv)
+{
+    int    watch = 0;
+    double interval = 0;
+    int    ch;
+
+    while ((ch = getopt(argc, argv, "w:h")) != -1) {
+        switch (ch) {
+        case 'w': watch = 1; interval = atof(optarg); break;
+        case 'h': usage(); return 0;
+        default:  usage(); return 1;
+        }
+    }
+    if (watch && interval <= 0) {
+        fprintf(stderr, "batinfo: bad -w interval\n");
+        return 1;
+    }
+
+    if (!watch) {
+        if (snapshot())
+            return 0;
         fprintf(stderr, "batinfo: no battery entries found"
                         " (desktop machine? unsupported battery path?)\n");
         return 1;
     }
-    return 0;
+
+    while (1) {
+        printf("\033[H\033[2J");
+        if (!snapshot())
+            fprintf(stderr, "batinfo: no battery entries found"
+                            " (desktop machine? unsupported battery path?)\n");
+        fflush(stdout);
+        usleep((useconds_t)(interval * 1000000.0));
+    }
 }
