@@ -14,13 +14,13 @@
  *   - every kernel folds its state into a checksum, printed at the
  *     end: proof the work really happened and was not optimized away
  *
- * Usage: cpuburn [-n THREADS] [-t SECONDS] [-d FRACTION] [-m MODE] [-P] [-h]
+ * Usage: cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
  *   -n N   threads (default 1; >1 oversubscribes single-core machines)
- *   -t S   duration in seconds (default 10)
- *   -d F   duty cycle 0.01..1.00 (default 1.0)
+ *   -t S   duration in seconds (default 600 = 10 min)
  *   -m M   mode: fp | int | vec | mem | mixed (default mixed)
- *   -P     do not drop to nice +10 (default: nice +10 so the session
- *          stays responsive on single-core machines)
+ *
+ * Always runs at normal priority and at full duty: no throttling,
+ * no scheduling tricks - the whole point is to heat the machine.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,7 +31,6 @@
 /* NOTE: Apple gcc 4.0 provides AltiVec builtins under -faltivec;
    /usr/lib/.../altivec.h must NOT be included (it self-disables there). */
 
-#define QUANTUM_US   10000.0                       /* scheduling tick */
 #define MEM_LEN      (8u << 20)                    /* 8 MB per thread */
 #define MEM_STEP     (64u << 10)                   /* advance 64 KB */
 #define MEM_WORDS    (MEM_LEN / 4)
@@ -48,7 +47,6 @@ static const char *mode_names[] = { "fp", "int", "vec", "mem", "mixed" };
 typedef struct {
     int            id;
     int            mode;
-    double         duty;
     double         deadline;
 
     double         busy_us;
@@ -348,20 +346,9 @@ static void *thread_main(void *arg)
 {
     burn_thread_t *t = (burn_thread_t *)arg;
 
-    for (;;) {
-        double now = now_us();
-        double busy, got;
-
-        if (now >= t->deadline)
-            break;
-        busy = t->duty * QUANTUM_US;
-        if (t->deadline - now < busy)
-            busy = t->deadline - now;
-        got = run_mode(t, busy);
-        t->busy_us += got;
-        if (QUANTUM_US - busy > 100.0)
-            usleep((useconds_t)(QUANTUM_US - busy));
-    }
+    /* full duty: burn until the deadline, no sleep quanta */
+    while (now_us() < t->deadline)
+        t->busy_us += run_mode(t, t->deadline - now_us());
     return NULL;
 }
 
@@ -371,36 +358,31 @@ static void usage(void)
 {
     int i;
     printf("cpuburn - CPU load generator for PowerPC (Mac OS X 10.4/10.5)\n\n"
-           "usage: cpuburn [-n THREADS] [-t SECONDS] [-d FRACTION]"
-           " [-m MODE] [-P] [-h]\n"
+           "usage: cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]\n"
            "  -n N   threads (default 1; >1 oversubscribes single-core)\n"
-           "  -t S   duration in seconds (default 10)\n"
-           "  -d F   duty cycle 0.01..1.00 (default 1.0)\n"
+           "  -t S   duration in seconds (default 600 = 10 min)\n"
            "  -m M   mode: ");
     for (i = 0; i < 5; i++)
         printf("%s%s", i ? "/" : "", mode_names[i]);
     printf(" (default mixed)\n"
-           "  -P     keep normal priority (default: nice +10)\n"
-           "  -h     this help\n");
+           "  -h     this help\n\n"
+           "Runs at normal priority, full duty (always burning at 100%%).\n");
 }
 
 int main(int argc, char **argv)
 {
     int            nthreads = 1;
     int            mode = MODE_MIXED;
-    int            no_nice = 0;
-    double         duration = 10.0;
-    double         duty = 1.0;
+    double         duration = 600.0;
     double         start, end;
     pthread_t     *pt;
     burn_thread_t *th;
     int            i, ch, mi = 5;
 
-    while ((ch = getopt(argc, argv, "n:t:d:m:Ph")) != -1) {
+    while ((ch = getopt(argc, argv, "n:t:m:h")) != -1) {
         switch (ch) {
         case 'n': nthreads = atoi(optarg); break;
         case 't': duration = atof(optarg); break;
-        case 'd': duty = atof(optarg); break;
         case 'm':
             for (mi = 4; mi >= 0; mi--)
                 if (strcmp(optarg, mode_names[mi]) == 0)
@@ -411,7 +393,6 @@ int main(int argc, char **argv)
             }
             mode = mi;
             break;
-        case 'P': no_nice = 1; break;
         case 'h': usage(); return 0;
         default:  usage(); return 1;
         }
@@ -424,13 +405,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "cpuburn: -t must be 0..86400 s\n");
         return 1;
     }
-    if (duty < 0.01 || duty > 1.0) {
-        fprintf(stderr, "cpuburn: -d must be 0.01..1.00\n");
-        return 1;
-    }
-
-    if (!no_nice)
-        nice(10);
 
     pt = (pthread_t *)calloc((size_t)nthreads, sizeof(pthread_t));
     th = (burn_thread_t *)calloc((size_t)nthreads, sizeof(burn_thread_t));
@@ -443,7 +417,6 @@ int main(int argc, char **argv)
         burn_thread_t *t = &th[i];
         t->id = i;
         t->mode = mode;
-        t->duty = duty;
         memset(t->fa, 0, sizeof t->fa);
         t->fx = 1.0;
         t->ia[0] = 0x9E3779B9u + (unsigned)i;
@@ -467,8 +440,8 @@ int main(int argc, char **argv)
 #endif
     }
 
-    printf("cpuburn: mode=%s threads=%d duty=%.0f%% duration=%.1f s\n",
-           mode_names[mode], nthreads, duty * 100.0, duration);
+    printf("cpuburn: mode=%s threads=%d duration=%.1f s\n",
+           mode_names[mode], nthreads, duration);
 
     start = now_us();
     for (i = 0; i < nthreads; i++) {
