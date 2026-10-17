@@ -29,9 +29,17 @@
  * Usage: fanmon [-w SECONDS]
  *   -w N   watch mode: refresh every N seconds (default: single run)
  *   -h     help
+ *
+ * Watch mode (-w N): each frame is fully rendered into an in-memory
+ * buffer BEFORE any terminal output (registry walking is slow - a
+ * clear-screen done before it would leave a visible blank phase, i.e.
+ * flicker), then redrawn in place with a single fast pass: cursor home
+ * (no clear-screen), overwrite, "\033[K" per line, "\033[J" below the
+ * frame.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +112,53 @@ static io_object_t find_owner(void)
     return found;
 }
 
+/* ------------------------------------------------------------- output */
+
+/* one-frame text buffer: the frame is rendered here BEFORE any terminal
+   output, so the redraw itself is a single fast pass (no blank phase,
+   no flicker) */
+
+static char   obuf[16384];
+static size_t olen;
+
+static void obuf_reset(void)
+{
+    olen = 0;
+    obuf[0] = 0;
+}
+
+static void addf(const char *fmt, ...)
+{
+    va_list ap;
+    int     n;
+
+    if (olen >= sizeof obuf - 1)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(obuf + olen, sizeof obuf - olen, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        olen += (size_t)n;
+        if (olen >= sizeof obuf)
+            olen = sizeof obuf - 1;
+    }
+}
+
+/* flicker-free redraw: cursor home without clearing, overwrite every
+   line (clearing its old tail), erase everything below the new frame */
+static void redraw(void)
+{
+    const char *p;
+
+    printf("\033[H");
+    for (p = obuf; *p; p++) {
+        if (*p == '\n')
+            fputs("\033[K", stdout);
+        putchar(*p);
+    }
+    fputs("\033[J", stdout);
+}
+
 /* ------------------------------------------------------------ display */
 
 static const char *pad(const char *s, size_t width)
@@ -122,14 +177,14 @@ static void print_snapshot(io_object_t owner)
     SInt64          cur, mn, mx, val;
 
     if (props_of(owner, &d) != KERN_SUCCESS || !d) {
-        printf("fanmon: cannot read registry properties\n");
+        addf("fanmon: cannot read registry properties\n");
         return;
     }
 
     /* ---- fans (IOHWControls, type fan-rpm) ---- */
     controls = get_array(d, CFSTR("IOHWControls"));
     n = controls ? CFArrayGetCount(controls) : 0;
-    printf("FANS\n");
+    addf("FANS\n");
     for (i = 0; i < n; i++) {
         CFTypeRef item = CFArrayGetValueAtIndex(controls, i);
 
@@ -146,17 +201,17 @@ static void print_snapshot(io_object_t owner)
         if (!get_num((CFDictionaryRef)item, CFSTR("target-value"), &val) &&
             !get_num((CFDictionaryRef)item, CFSTR("current-value"), &val))
             continue;
-        printf("  %s %6.0f rpm", pad(loc, 13), (double)val);
+        addf("  %s %6.0f rpm", pad(loc, 13), (double)val);
         if (get_num((CFDictionaryRef)item, CFSTR("min-value"), &mn) &&
             get_num((CFDictionaryRef)item, CFSTR("max-value"), &mx))
-            printf("  (%ld..%ld)", (long)mn, (long)mx);
-        printf("\n");
+            addf("  (%ld..%ld)", (long)mn, (long)mx);
+        addf("\n");
     }
 
     /* ---- sensors (IOHWSensors) ---- */
     sensors = get_array(d, CFSTR("IOHWSensors"));
     n = sensors ? CFArrayGetCount(sensors) : 0;
-    printf("TEMPERATURES\n");
+    addf("TEMPERATURES\n");
     for (i = 0; i < n; i++) {
         CFTypeRef item = CFArrayGetValueAtIndex(sensors, i);
 
@@ -169,9 +224,9 @@ static void print_snapshot(io_object_t owner)
         if (!get_num((CFDictionaryRef)item, CFSTR("current-value"), &cur))
             continue;
         if (strcmp(type, "temp") == 0 || strcmp(type, "temperature") == 0)
-            printf("  %s %7.1f C\n", pad(loc, 13), (double)cur / 65536.0);
+            addf("  %s %7.1f C\n", pad(loc, 13), (double)cur / 65536.0);
     }
-    printf("ELECTRICAL\n");
+    addf("ELECTRICAL\n");
     for (i = 0; i < n; i++) {
         CFTypeRef item = CFArrayGetValueAtIndex(sensors, i);
         const char *unit;
@@ -185,11 +240,11 @@ static void print_snapshot(io_object_t owner)
         if (!get_num((CFDictionaryRef)item, CFSTR("current-value"), &cur))
             continue;
         if (strcmp(type, "power") == 0)
-           { unit = "W"; printf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
+           { unit = "W"; addf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
         else if (strcmp(type, "current") == 0)
-            { unit = "A"; printf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
+            { unit = "A"; addf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
         else if (strcmp(type, "voltage") == 0)
-            { unit = "V"; printf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
+            { unit = "V"; addf("  %s %7.2f %s\n", pad(loc, 13), (double)cur / 65536.0, unit); }
     }
 
     CFRelease(d);
@@ -276,29 +331,29 @@ static int pmu_snapshot(void)
     if (n == 0)
         return 0;
 
-    printf("FANS (PMU)\n");
+    addf("FANS (PMU)\n");
     for (i = 0; i < n; i++)
         if (strcmp(s[i].type, "fanspeed") == 0)
-            printf("  %s %6.0f rpm\n", pad(s[i].loc, 13), (double)s[i].cur);
+            addf("  %s %6.0f rpm\n", pad(s[i].loc, 13), (double)s[i].cur);
 
-    printf("TEMPERATURES\n");
+    addf("TEMPERATURES\n");
     for (i = 0; i < n; i++)
         if (strcmp(s[i].type, "temp") == 0 ||
             strcmp(s[i].type, "temperature") == 0)
-            printf("  %s %7.1f C\n", pad(s[i].loc, 13),
-                   (double)s[i].cur / 65536.0);
+            addf("  %s %7.1f C\n", pad(s[i].loc, 13),
+                 (double)s[i].cur / 65536.0);
 
-    printf("ELECTRICAL\n");
+    addf("ELECTRICAL\n");
     for (i = 0; i < n; i++)
         if (strcmp(s[i].type, "voltage") == 0)
-            printf("  %s %7.2f V\n", pad(s[i].loc, 13),
-                   (double)s[i].cur / 65536.0);
+            addf("  %s %7.2f V\n", pad(s[i].loc, 13),
+                 (double)s[i].cur / 65536.0);
         else if (strcmp(s[i].type, "current") == 0)
-            printf("  %s %7.2f A\n", pad(s[i].loc, 13),
-                   (double)s[i].cur / 65536.0);
+            addf("  %s %7.2f A\n", pad(s[i].loc, 13),
+                 (double)s[i].cur / 65536.0);
         else if (strcmp(s[i].type, "power") == 0)
-            printf("  %s %7.2f W\n", pad(s[i].loc, 13),
-                   (double)s[i].cur / 65536.0);
+            addf("  %s %7.2f W\n", pad(s[i].loc, 13),
+                 (double)s[i].cur / 65536.0);
     return 1;
 }
 
@@ -337,10 +392,13 @@ int main(int argc, char **argv)
         if (owner) {
             print_snapshot(owner);
             IOObjectRelease(owner);
+            fputs(obuf, stdout);
             return 0;
         }
-        if (pmu_snapshot())                /* PMU (G4) path */
+        if (pmu_snapshot()) {              /* PMU (G4) path */
+            fputs(obuf, stdout);
             return 0;
+        }
         fprintf(stderr, "fanmon: no IOHWSensors/IOHWControls owner found"
                         " and no IOHWSensor nodes"
                         " (unsupported machine?)\n");
@@ -348,13 +406,15 @@ int main(int argc, char **argv)
     }
 
     while (1) {
-        printf("\033[H\033[2J");
+        obuf_reset();
         if (owner) {
             print_snapshot(owner);
         } else if (!pmu_snapshot()) {
-            fprintf(stderr, "fanmon: unsupported machine?\n");
-            return 1;
+            addf("fanmon: unsupported machine?\n");
         }
+        /* output goes out only now: the frame was fully rendered off-
+           screen, the redraw keeps the text in place between frames */
+        redraw();
         fflush(stdout);
         usleep((useconds_t)(interval * 1000000.0));
     }
