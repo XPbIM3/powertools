@@ -9,7 +9,12 @@
  *   - temperatures / power / current / voltage are stored as 16.16 fixed
  *     point (divide by 65536). Verified against the internal PID profile:
  *     HD input-target 3801088 => 58.0 C, power-max 2949120 => 45 W (G5 TDP).
- *   - fan controllers of type "fan-rpm" expose plain RPM.
+ *   - fan controllers of type "fan-rpm": plain RPM. The displayed RPM is
+ *     taken from "target-value" - the only number that actually moves on
+ *     SMU machines; the registry "current-value" stays frozen at ~min
+ *     regardless of load (verified on iMac G5, Tiger 10.4.11 and
+ *     Leopard 10.5.8, see notes-*.md). Physical listening confirmed the
+ *     fan pitch follows target-value.
  *
  * Usage: fanmon [-w SECONDS]
  *   -w N   watch mode: refresh every N seconds (default: single run)
@@ -104,8 +109,7 @@ static void print_snapshot(io_object_t owner)
     CFArrayRef              sensors, controls;
     CFIndex                 i, n;
     char            loc[64], type[64];
-    SInt64          cur, mn, mx, tgt;
-    int             have;
+    SInt64          cur, mn, mx, val;
 
     if (props_of(owner, &d) != KERN_SUCCESS || !d) {
         printf("fanmon: cannot read registry properties\n");
@@ -127,15 +131,15 @@ static void print_snapshot(io_object_t owner)
             continue;
         if (!get_str((CFDictionaryRef)item, CFSTR("location"), loc, sizeof loc))
             snprintf(loc, sizeof loc, "fan #%ld", (long)i);
-        have = get_num((CFDictionaryRef)item, CFSTR("current-value"), &cur);
-        if (!have)
+        /* Display RPM from target-value (the live number); fall back to
+           the frozen current-value only if no target is published. */
+        if (!get_num((CFDictionaryRef)item, CFSTR("target-value"), &val) &&
+            !get_num((CFDictionaryRef)item, CFSTR("current-value"), &val))
             continue;
-        printf("  %s %6.0f rpm", pad(loc, 13), (double)cur);
+        printf("  %s %6.0f rpm", pad(loc, 13), (double)val);
         if (get_num((CFDictionaryRef)item, CFSTR("min-value"), &mn) &&
             get_num((CFDictionaryRef)item, CFSTR("max-value"), &mx))
             printf("  (%ld..%ld)", (long)mn, (long)mx);
-        if (get_num((CFDictionaryRef)item, CFSTR("target-value"), &tgt))
-            printf("  target %ld", (long)tgt);
         printf("\n");
     }
 
@@ -185,7 +189,7 @@ static void print_snapshot(io_object_t owner)
 
 static void usage(void)
 {
-    printf("fanmon - fans & temperature monitor for Mac OS X Tiger (PPC)\n\n"
+    printf("fanmon - fans & temperature monitor for Mac OS X Tiger/Leopard (PPC)\n\n"
            "usage: fanmon [-w SECONDS] [-h]\n"
            "  -w N  watch mode: refresh every N seconds\n"
            "  -h    this help\n");
