@@ -159,17 +159,18 @@ static void phase(kern_fn run, bench_t *t, double secs,
     *wall_out = el;
 }
 
-/* Leopard quirk: HW_CPU_FREQ can come as MHz shifted by 32 bits
-   (7730941132800 was observed for a 1.8 GHz machine). Heuristic:
-   huge exact multiples of 2^32 -> shift; else if it looks like Hz
-   -> divide by 10^6; else assume it is already MHz. */
+/* Leopard quirk: HW_CPU_FREQ can come as Hz shifted by exactly 32 bits
+   (in the wild: 7730941132800000000 = 1800000000 Hz << 32; Geekbench-able
+   machines may also plain-Hz or plain-MHz). Heuristic: exact multiples
+   of 2^32 -> shift back; then anything over 1e6 is Hz -> divide; else
+   assume MHz. */
 static unsigned long long freq_mhz(unsigned long long v)
 {
     if (v > 5000ull) {
         if (v > 4294967295ull && (v & 0xffffffffull) == 0)
-            return v >> 32;
-        if (v > 1000000ull)
-            return v / 1000000ull;
+            v >>= 32;                        /* Leopard: value << 32 */
+        if (v > 1000000ull)                  /* Hz -> MHz */
+            v /= 1000000ull;
     }
     return v;
 }
