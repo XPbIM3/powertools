@@ -1,10 +1,21 @@
 # fanmon
 
-Консольный монитор вентиляторов и температур для Mac OS X Tiger/Leopard на PowerPC.
-Оптимизирован под iMac G5 (PowerMac8,1), работает на любой SMU-машине.
+Консольный монитор вентиляторов, температур и электрики для Mac OS X
+Tiger/Leopard на PowerPC **G4/G5**. Одна кодовая база, два пути данных,
+автоматическое определение платформы; только публичный IOKit API.
 
-Читает словари `IOHWControls` и `IOHWSensors` из IORegistry через публичный
-IOKit API. Никаких приватных интерфейсов, чистый C.
+## Пути данных (auto-detect)
+
+- **SMU (G5)** — iMac G5 / Power Mac G5: читает словари `IOHWSensors` и
+  `IOHWControls` платформенного плагина (узлы `SMU_*_PlatformPlugin`).
+- **PMU (G4)** — iBook/PowerBook G4, Mac mini G4, Power Mac G4: словарей
+  нет, берутся по одному сервисными узлы `IOHWSensor` (драйвер
+  `AppleHWSensor`), те же масштабы 16.16 (÷65536).
+
+Особенности данных: на SMU-машинах обороты берутся из `target-value`
+(реестровый `current-value` «заморожен» — см. `notes-*.md`); на PMU-машинах
+`fanspeed` = 0 rpm — **валидное** показание: PMU полностью выключает
+вентилятор, пока машина холодна (iBook G4).
 
 ## Вывод
 
