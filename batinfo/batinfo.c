@@ -61,6 +61,30 @@ static CFArrayRef get_array(CFDictionaryRef d, CFStringRef key)
     return (CFArrayRef)v;
 }
 
+/* like get_str, but also accepts CFData (device-tree strings are often
+   published as data, e.g. "device_type" = <"battery"> on PMU nubs)   */
+static int get_prop_str(CFDictionaryRef d, CFStringRef key,
+                        char *buf, size_t n)
+{
+    CFTypeRef v = CFDictionaryGetValue(d, key);
+    if (!v)
+        return 0;
+    if (CFGetTypeID(v) == CFStringGetTypeID())
+        return CFStringGetCString((CFStringRef)v, buf, (CFIndex)n,
+                                  kCFStringEncodingUTF8);
+    if (CFGetTypeID(v) == CFDataGetTypeID()) {
+        CFIndex len = CFDataGetLength((CFDataRef)v);
+        if (len >= (CFIndex)n)
+            len = (CFIndex)n - 1;
+        if (len < 0)
+            return 0;
+        memcpy(buf, CFDataGetBytePtr((CFDataRef)v), (size_t)len);
+        buf[len] = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void bits_list(unsigned long long flags, char *buf, size_t n){
     int    first = 1;
     int    b;
@@ -117,11 +141,13 @@ static void print_battery_dict(CFDictionaryRef item, int idx)
         printf("  Cycle count      %7lld\n", cycles);
 
     /* series-count guess: only credible when the pack is charged above
-       50% - the 3S/4S voltage ranges unambiguously overlap below that */
+       50% - the 3S/4S voltage ranges unambiguously overlap below that.
+       Voltage is published in mV - convert before comparing to volts. */
     vcell[0] = 0;
     if (have_v && rem_pct > 50.0) {
-        double p3 = (double)voltage / 3.0;
-        double p4 = (double)voltage / 4.0;
+        double vv = (double)voltage / 1000.0;
+        double p3 = vv / 3.0;
+        double p4 = vv / 4.0;
         if (p3 >= 3.3 && p3 <= 4.3)
             snprintf(vcell, sizeof vcell,
                      "(~3S: ~%.2f V/cell, derived)", p3);
@@ -170,18 +196,29 @@ static int print_pmu_batteries(void)
         if (!e)
             break;
         if (props_of(e, &d) == KERN_SUCCESS && d) {
-            batt = get_array(d, CFSTR("IOBatteryInfo"));
-            if (batt) {
-                CFIndex i, n = CFArrayGetCount(batt);
-                for (i = 0; i < n; i++) {
-                    CFTypeRef item = CFArrayGetValueAtIndex(batt, i);
-                    if (item &&
-                        CFGetTypeID(item) == CFDictionaryGetTypeID())
-                        print_battery_dict((CFDictionaryRef)item, idx++);
-                }
-                found = 1;
+            char dt[32];
+            /* take only dedicated battery nubs, skip PMU's own copy
+               (it publishes the same dict without device_type=battery);
+               device_type is CFData on these nubs - use get_prop_str */
+            if (!get_prop_str(d, CFSTR("device_type"), dt, sizeof dt) ||
+                strcmp(dt, "battery") != 0) {
+                CFRelease(d);
+                d = NULL;
             }
-            CFRelease(d);
+            if (d) {
+                batt = get_array(d, CFSTR("IOBatteryInfo"));
+                if (batt) {
+                    CFIndex i, n = CFArrayGetCount(batt);
+                    for (i = 0; i < n; i++) {
+                        CFTypeRef item = CFArrayGetValueAtIndex(batt, i);
+                        if (item &&
+                            CFGetTypeID(item) == CFDictionaryGetTypeID())
+                            print_battery_dict((CFDictionaryRef)item, idx++);
+                    }
+                    found = 1;
+                }
+                CFRelease(d);
+            }
         }
         IOObjectRelease(e);
     }
