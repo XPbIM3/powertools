@@ -15,11 +15,12 @@
  *
  * Scheme (why there is no "random ops" inside the timed loop):
  *   - kernels are deterministic with an exact operation count;
- *   - there are NO clock reads inside the hot loop (gettimeofday can
- *     cost more than the measured work on these machines);
- *   - instead a short calibration run measures the pass rate, then the
- *     timed phase executes a precomputed pass count with wall-clock
- *     taken only around the whole phase;
+ *   - the phase runs in ~0.35 s chunks; the clock is read once per chunk
+ *     and once at the end (<0.5% overhead, and self-correcting: the rate
+ *     is ops/actual wall, so no precomputed pass count is needed);
+ *   - each phase is preceded by an uncounted warmup chunk: PPC 970FX/G4
+ *     start from idle at a low P-state and ramp up, so measuring cold
+ *     underestimates the rate (seen 40% error without warmup);
  *   - a fold of the final state (checksum) is printed: proof the work
  *     really happened and was not folded away by the compiler.
  *
@@ -114,8 +115,8 @@ static void int_run(bench_t *t, unsigned long long passes)
 
 typedef void (*kern_fn)(bench_t *, unsigned long long);
 
-/* grow a fixed-size workload until one chunk takes >= MIN_S seconds,
-   then return passes per second (no clocks inside the hot loop) */
+/* grow a fixed-size workload until one chunk takes >= MIN_S seconds;
+   used only to size the ~0.35 s chunks for the timed phase */
 #define MIN_S 0.15
 static double find_rate(kern_fn run, bench_t *t)
 {
@@ -130,6 +131,47 @@ static double find_rate(kern_fn run, bench_t *t)
             return (double)n / el;
         n *= 4;
     }
+}
+
+/* run the phase in ~0.35 s chunks: one clock read per chunk + at the end
+   (<0.5% overhead). An uncounted warmup chunk first (the 970FX/G4 start
+   at a low P-state and ramp up; measuring cold gave 40% errors), then
+   chunked work until the wall budget is reached. */
+static void phase(kern_fn run, bench_t *t, double secs,
+                  unsigned long long *ops_out, double *wall_out)
+{
+    unsigned long long K, n = 0;
+    double             t0, el;
+
+    K = (unsigned long long)(find_rate(run, t) * 0.35);
+    if (K < 16)
+        K = 16;
+    run(t, K);                                 /* warmup, uncounted */
+    t0 = now_us();
+    for (;;) {
+        run(t, K);
+        n += K;
+        el = (now_us() - t0) / 1000000.0;
+        if (el >= secs)
+            break;
+    }
+    *ops_out = n;
+    *wall_out = el;
+}
+
+/* Leopard quirk: HW_CPU_FREQ can come as MHz shifted by 32 bits
+   (7730941132800 was observed for a 1.8 GHz machine). Heuristic:
+   huge exact multiples of 2^32 -> shift; else if it looks like Hz
+   -> divide by 10^6; else assume it is already MHz. */
+static unsigned long long freq_mhz(unsigned long long v)
+{
+    if (v > 5000ull) {
+        if (v > 4294967295ull && (v & 0xffffffffull) == 0)
+            return v >> 32;
+        if (v > 1000000ull)
+            return v / 1000000ull;
+    }
+    return v;
 }
 
 static void print_cpu(void)
@@ -147,7 +189,7 @@ static void print_cpu(void)
     mib[1] = HW_CPU_FREQ;
     len = sizeof mhz;
     if (sysctl(mib, 2, &mhz, &len, NULL, 0) == 0 && mhz)
-        printf(", %llu MHz", mhz / 1000000ull);
+        printf(", %llu MHz", freq_mhz(mhz));
     printf("\n");
 }
 
@@ -162,19 +204,18 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     bench_t            t;
-    double             phase = 10.0;
-    double             rate, wall_fp, wall_int;
+    double             secs = 10.0, wall_fp, wall_int;
     unsigned long long n_fp, n_int;
     int                ch;
 
     while ((ch = getopt(argc, argv, "t:h")) != -1) {
         switch (ch) {
-        case 't': phase = atof(optarg); break;
+        case 't': secs = atof(optarg); break;
         case 'h': usage(); return 0;
         default:  usage(); return 1;
         }
     }
-    if (phase < 0.1 || phase > 86400.0) {
+    if (secs < 0.1 || secs > 86400.0) {
         fprintf(stderr, "cpubench: -t must be 0.1..86400\n");
         return 1;
     }
@@ -188,37 +229,25 @@ int main(int argc, char **argv)
 
     printf("cpubench (PowerPC Mac OS X 10.4/10.5)\n");
     print_cpu();
-    printf("phases: FP %.1f s + INT %.1f s (+ ~0.5 s calibration)\n\n",
-           phase, phase);
+    printf("phases: FP %.1f s + INT %.1f s (chunks + warmup, ~%.1f s total)\n\n",
+           secs, secs, 2.0 * secs + 1.5);
 
     /* ---------- FP phase ---------- */
-    rate = find_rate(fp_run, &t);
-    n_fp = (unsigned long long)(rate * phase);
-    {
-        double t0 = now_us();
-        fp_run(&t, n_fp);
-        wall_fp = (now_us() - t0) / 1000000.0;
-        printf("FP : %llu FMADD in %.2f s\n"
-               "     %8.2f million FMADD/s\n"
-               "     %8.3f GFLOP/s    (mul+add counted, double 64-bit)\n",
-               n_fp, wall_fp,
-               (double)n_fp / wall_fp / 1e6,
-               2.0 * (double)n_fp / wall_fp / 1e9);
-    }
+    phase(fp_run, &t, secs, &n_fp, &wall_fp);
+    printf("FP : %.3g billion FMADD in %.2f s\n"
+           "     %8.2f billion FMADD/s\n"
+           "     %8.3f GFLOP/s    (mul+add counted, double 64-bit)\n",
+           (double)n_fp / 1e9, wall_fp,
+           16.0 * (double)n_fp / wall_fp / 1e9,
+           32.0 * (double)n_fp / wall_fp / 1e9);
     t.passes = 0;
 
     /* ---------- INT phase ---------- */
-    rate = find_rate(int_run, &t);
-    n_int = (unsigned long long)(rate * phase);
-    {
-        double t0 = now_us();
-        int_run(&t, n_int);
-        wall_int = (now_us() - t0) / 1000000.0;
-        printf("INT: %llu passes in %.2f s\n"
-               "     %8.2f million ALU ops/s\n",
-               n_int, wall_int,
-               192.0 * (double)n_int / wall_int / 1e6);
-    }
+    phase(int_run, &t, secs, &n_int, &wall_int);
+    printf("INT: %.3g billion passes in %.2f s\n"
+           "     %8.2f billion ALU ops/s\n",
+           (double)n_int / 1e9, wall_int,
+           192.0 * (double)n_int / wall_int / 1e9);
 
     printf("\nchecksum: %016llx  (proof of real work)\n"
            "total wall: %.2f s\n",
