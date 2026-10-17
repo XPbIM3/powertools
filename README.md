@@ -13,10 +13,11 @@ Power Mac G4 / Power Mac G5 (PowerPC Apple)** — мониторинга, тес
   «MDD», Mac mini G4) и **G5 (SMU-платформа: iMac G5, Power Mac G5)**.
   Акцент текущих работ — SMU/G5 (iMac G5).
 - **Машины, на которых ведётся тестирование:** iMac G5 (PowerMac8,1) с
-  Tiger/Leopard; iBook G4 (PowerBook6,5) с Tiger; **iBook G3
-  (PowerBook4,3, Dual USB) с Tiger 10.4.11** — реальность оказалась
-  свежее плана (система новее ноутбука); детали G3 — в
-  `fanmon/notes-g3.md`.
+  Tiger/Leopard; iBook G4 (PowerBook6,5) с Tiger; **PowerBook G4 15"
+  (PowerBook5,6, 1.67 ГГц) с Leopard 10.5.8** — первая G4+Leopard
+  комбинация, бинарь из гита работает (см. `fanmon/notes-pb15.md`);
+  iBook G3 (PowerBook4,3) с Tiger — батарейный мостик, сенсоров нет
+  (см. `fanmon/notes-g3.md`).
 
 ## Принципы ведения репозитория
 
