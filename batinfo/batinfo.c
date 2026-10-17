@@ -19,10 +19,17 @@
  * Derived values are marked as derived: charge %, health %, the 3S/4S
  * series-count guess (heuristic, NOT a hardware fact) and ~V per cell.
  *
- * Usage: batinfo [-h]
+ * Watch mode (-w N): the whole frame is rendered into an in-memory buffer
+ * first (registry walking is slow - doing it after clear would leave the
+ * screen blank and visibly flicker), then redrawn in place: cursor home,
+ * overwrite, "\033[K" per line, "\033[J" below the frame. No clear-screen
+ * phase, no flicker.
+ *
+ * Usage: batinfo [-w SECONDS] [-h]
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +92,8 @@ static int get_prop_str(CFDictionaryRef d, CFStringRef key,
     return 0;
 }
 
-static void bits_list(unsigned long long flags, char *buf, size_t n){
+static void bits_list(unsigned long long flags, char *buf, size_t n)
+{
     int    first = 1;
     int    b;
     size_t used = 0;
@@ -97,6 +105,52 @@ static void bits_list(unsigned long long flags, char *buf, size_t n){
                                      first ? "" : ",", b);
             first = 0;
         }
+}
+
+/* ------------------------------------------------------------- output */
+
+/* one-frame text buffer: everything is rendered here BEFORE any terminal
+   output, so the redraw itself is a single fast pass */
+
+static char   obuf[16384];
+static size_t olen;
+
+static void obuf_reset(void)
+{
+    olen = 0;
+    obuf[0] = 0;
+}
+
+static void addf(const char *fmt, ...)
+{
+    va_list ap;
+    int     n;
+
+    if (olen >= sizeof obuf - 1)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(obuf + olen, sizeof obuf - olen, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        olen += (size_t)n;
+        if (olen >= sizeof obuf)
+            olen = sizeof obuf - 1;
+    }
+}
+
+/* flicker-free redraw: cursor home without clearing, overwrite every
+   line (clearing its old tail), erase everything below the new frame */
+static void redraw(void)
+{
+    const char *p;
+
+    printf("\033[H");
+    for (p = obuf; *p; p++) {
+        if (*p == '\n')
+            fputs("\033[K", stdout);
+        putchar(*p);
+    }
+    fputs("\033[J", stdout);
 }
 
 /* ------------------------------------------------------------ battery */
@@ -118,27 +172,27 @@ static void print_battery_dict(CFDictionaryRef item, int idx)
     (void)get_num(item, CFSTR("Cycle Count"), &cycles);
     have_f   = get_num(item, CFSTR("Flags"), &flags);
 
-    printf("BATTERY %d\n", idx);
+    addf("BATTERY %d\n", idx);
 
     if (have_c && have_cap && capacity > 0) {
         rem_pct = 100.0 * (double)current / (double)capacity;
-        printf("  Remaining        %7lld mAh  (%.1f %% of full charge,"
-               " derived)\n", current, rem_pct);
+        addf("  Remaining        %7lld mAh  (%.1f %% of full charge,"
+             " derived)\n", current, rem_pct);
     } else if (have_c) {
-        printf("  Remaining        %7lld mAh\n", current);
+        addf("  Remaining        %7lld mAh\n", current);
     }
     if (have_cap)
-        printf("  Full charge cap. %7lld mAh\n", capacity);
+        addf("  Full charge cap. %7lld mAh\n", capacity);
     if (have_des) {
         if (capacity > 0)
-            printf("  Design cap.      %7lld mAh  (health %.1f %%,"
-                   " derived)\n", design,
-                   100.0 * (double)capacity / (double)design);
+            addf("  Design cap.      %7lld mAh  (health %.1f %%,"
+                 " derived)\n", design,
+                 100.0 * (double)capacity / (double)design);
         else
-            printf("  Design cap.      %7lld mAh\n", design);
+            addf("  Design cap.      %7lld mAh\n", design);
     }
     if (cycles)
-        printf("  Cycle count      %7lld\n", cycles);
+        addf("  Cycle count      %7lld\n", cycles);
 
     /* series-count guess: only credible when the pack is charged above
        50% - the 3S/4S voltage ranges unambiguously overlap below that.
@@ -156,8 +210,8 @@ static void print_battery_dict(CFDictionaryRef item, int idx)
                      "(~4S: ~%.2f V/cell, derived)", p4);
     }
     if (have_v)
-        printf("  Pack voltage     %7lld mV   (%.2f V) %s\n",
-               voltage, (double)voltage / 1000.0, vcell);
+        addf("  Pack voltage     %7lld mV   (%.2f V) %s\n",
+             voltage, (double)voltage / 1000.0, vcell);
 
     if (have_amp) {
         const char *note;
@@ -167,13 +221,12 @@ static void print_battery_dict(CFDictionaryRef item, int idx)
             note = "(<0 = discharging)";
         else
             note = "(no charge/disch. current - on AC)";
-        printf("  Amperage         %7lld mA   %s\n", amperage, note);
+        addf("  Amperage         %7lld mA   %s\n", amperage, note);
     }
     if (have_f) {
-        printf("  Flags            0x%llx / %lld\n",
-               flags, flags);
+        addf("  Flags            0x%llx / %lld\n", flags, flags);
         bits_list((unsigned long long)flags, bitbuf, sizeof bitbuf);
-        printf("                   set bits: %s\n", bitbuf);
+        addf("                   set bits: %s\n", bitbuf);
     }
 }
 
@@ -255,24 +308,24 @@ static int print_smart_batteries(void)
             if (!get_num(d, CFSTR("InstantAmperage"), &amp))
                 get_num(d, CFSTR("Amperage"), &amp);
 
-            printf("BATTERY %d (smart-battery style)\n", idx++);
-            printf("  Remaining        %7lld mAh", currc);
+            addf("BATTERY %d (smart-battery style)\n", idx++);
+            addf("  Remaining        %7lld mAh", currc);
             if (maxc > 0)
-                printf("  (%.1f %%, derived)",
-                       100.0 * (double)currc / (double)maxc);
-            printf("\n  Full charge cap. %7lld mAh\n", maxc);
+                addf("  (%.1f %%, derived)",
+                     100.0 * (double)currc / (double)maxc);
+            addf("\n  Full charge cap. %7lld mAh\n", maxc);
             if (desgc > 0) {
-                printf("  Design cap.      %7lld mAh", desgc);
+                addf("  Design cap.      %7lld mAh", desgc);
                 if (maxc > 0)
-                    printf("  (health %.1f %%, derived)",
-                           100.0 * (double)maxc / (double)desgc);
-                printf("\n");
+                    addf("  (health %.1f %%, derived)",
+                         100.0 * (double)maxc / (double)desgc);
+                addf("\n");
             }
-            printf("  Pack voltage     %7lld mV   (%.2f V)\n", v,
-                   (double)v / 1000.0);
-            printf("  Amperage         %7lld mA\n", amp);
+            addf("  Pack voltage     %7lld mV   (%.2f V)\n", v,
+                 (double)v / 1000.0);
+            addf("  Amperage         %7lld mA\n", amp);
             if (cyc)
-                printf("  Cycle count      %7lld\n", cyc);
+                addf("  Cycle count      %7lld\n", cyc);
             found = 1;
         }
         if (d)
@@ -312,16 +365,16 @@ static int print_battery_sensors(void)
             strcmp(cls, "IOHWSensor") == 0 &&
             strstr(loc, "BATTERY") != NULL) {
             if (!found) {
-                printf("BATTERY SENSORS\n");
+                addf("BATTERY SENSORS\n");
                 found = 1;
             }
             if (strcmp(type, "temperature") == 0 ||
                 strcmp(type, "temp") == 0)
-                printf("  %-13s %7.1f C\n", loc, (double)cur / 65536.0);
+                addf("  %-13s %7.1f C\n", loc, (double)cur / 65536.0);
             else if (strcmp(type, "voltage") == 0)
-                printf("  %-13s %7.2f V\n", loc, (double)cur / 65536.0);
+                addf("  %-13s %7.2f V\n", loc, (double)cur / 65536.0);
             else if (strcmp(type, "current") == 0)
-                printf("  %-13s %7.2f A\n", loc, (double)cur / 65536.0);
+                addf("  %-13s %7.2f A\n", loc, (double)cur / 65536.0);
         }
         if (d)
             CFRelease(d);
@@ -341,18 +394,20 @@ static void usage(void)
            "  -h    this help\n");
 }
 
-/* one full snapshot; returns 0 if nothing battery-like was found */
-static int snapshot(void)
+/* render one full frame into obuf; returns # of battery sets found */
+static int snapshot(int watch)
 {
     int pmu, sb;
 
-    printf("batinfo (PowerPC Mac OS X 10.4/10.5, public IOKit registry)\n"
-           "press Ctrl-C to exit watch mode\n\n");
+    obuf_reset();
+    addf("batinfo (PowerPC Mac OS X 10.4/10.5, public IOKit registry)\n");
+    if (watch)
+        addf("press Ctrl-C to exit watch mode\n");
+    addf("\n");
 
     pmu = print_pmu_batteries();
     sb  = print_smart_batteries();
     print_battery_sensors();
-
     return pmu + sb;
 }
 
@@ -375,18 +430,20 @@ int main(int argc, char **argv)
     }
 
     if (!watch) {
-        if (snapshot())
-            return 0;
-        fprintf(stderr, "batinfo: no battery entries found"
-                        " (desktop machine? unsupported battery path?)\n");
-        return 1;
+        if (snapshot(0) == 0) {
+            fprintf(stderr, "batinfo: no battery entries found"
+                            " (desktop machine? unsupported battery path?)\n");
+            return 1;
+        }
+        fputs(obuf, stdout);
+        return 0;
     }
 
     while (1) {
-        printf("\033[H\033[2J");
-        if (!snapshot())
-            fprintf(stderr, "batinfo: no battery entries found"
-                            " (desktop machine? unsupported battery path?)\n");
+        if (snapshot(1) == 0)
+            addf("no battery entries found"
+                 " (desktop machine? unsupported battery path?)\n");
+        redraw();              /* single fast pass, no clear-screen */
         fflush(stdout);
         usleep((useconds_t)(interval * 1000000.0));
     }
