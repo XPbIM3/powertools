@@ -38,6 +38,7 @@ echo "=== hwshot `date` ===" > "$H"
 echo "host:   `hostname 2>/dev/null`" >> "$H"
 echo "user:   `whoami 2>/dev/null`" >> "$H"
 echo "model:  $MODEL" >> "$H"
+echo "arch:   `uname -m 2>/dev/null`" >> "$H"
 echo "os:     $OSVER" >> "$H"
 sw_vers >> "$H" 2>&1
 echo "--- sysctl ---" >> "$H"
