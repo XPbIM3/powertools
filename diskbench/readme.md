@@ -19,8 +19,8 @@
 
 ```
 ./diskbench [-s SIZE] [-r SIZE] [-p PATH] [-b SIZE] [-B SIZE] [-c] [-k] [-h]
-  -s SIZE   размер чанка для линейных тестов   (default 128M)
-  -r SIZE   размер чанка для случайных тестов  (default 64M)
+  -s SIZE   размер чанка для линейных тестов   (default 512M)
+  -r SIZE   размер чанка для случайных тестов  (default 16M)
   -p PATH   путь к чанк-файлу                  (default ./diskbench_chunk.bin)
   -b SIZE   блок линейного I/O                 (default 4M)
   -B SIZE   блок случайного I/O                (default 4K)
@@ -34,15 +34,19 @@
 
 ## Использованная среда сборки
 
-- **ОС:** Mac OS X 10.4.11 (Tiger), Build 8S165
-- **Архитектура:** PowerPC (iMac G5, Power Macintosh)
-- **Тулчейн:** Xcode 2.5 → GCC 4.0.1 (powerpc-apple-darwin8-gcc-4.0.1, Apple build 5370)
-- Сборка флагами: `-std=gnu99 -O2 -Wall` — без warnings
+- **ОС:** Mac OS X 10.5.8 (Leopard), Build 9L31a
+- **Архитектура:** PowerPC (Power Macintosh G5 тара, PowerMac7,3)
+- **Тулчейн:** GCC 4.0.1 (powerpc-apple-darwin9-gcc-4.0.1, Apple build 5493)
+- Сборка флагами: `-std=gnu99 -O2 -Wall -mcpu=G3 -Wl,-force_cpusubtype_ALL` — без warnings
+- Подтип бинарника: **PPC/ALL** (как у канонических Tiger-сборок), G3-совместимость
+  сохранена. Каноничное «младшее» правило (сборка на Tiger, gcc 4.0.1 darwin8)
+  сохраняется как цель — вернуться на Tiger-тулчейн при появлении iBook G4 в онлайне.
+  `force_cpusubtype_ALL` в Makefile вшита именно на случай сборки на Leopard-инструменте.
 
 ## Как собрать ещё раз
 
 ```sh
-ssh tiger
+ssh powermac-g5
 cd ~/Projects/diskbench
 make clean && make
 ```

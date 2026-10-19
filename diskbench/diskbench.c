@@ -11,8 +11,8 @@
  * removed afterwards (unless -k).
  *
  * Usage: diskbench [options]
- *   -s SIZE   linear test chunk size   (default 256M)
- *   -r SIZE   random test chunk size   (default 256M)
+ *   -s SIZE   linear test chunk size   (default 512M)
+ *   -r SIZE   random test chunk size   (default 16M)
  *   -p PATH   chunk file base path     (default ./diskbench_chunk.bin)
  *   -b SIZE   linear I/O block size    (default 4M)
  *   -B SIZE   random I/O block size    (default 4K)
@@ -36,8 +36,8 @@
 #include <sys/sysctl.h>
 
 #define DEFAULT_PATH    "./diskbench_chunk.bin"
-#define DEFAULT_LIN     (128ULL << 20)   /* 128 MB */
-#define DEFAULT_RND     (64ULL  << 20)   /* 64 MB  */
+#define DEFAULT_LIN     (512ULL << 20)   /* 512 MB */
+#define DEFAULT_RND     (16ULL  << 20)   /* 16 MB  */
 #define DEFAULT_LIN_BLK (4ULL   << 20)   /* 4 MB   */
 #define DEFAULT_RND_BLK 4096ULL          /* 4 KiB  */
 
