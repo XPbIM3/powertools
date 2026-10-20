@@ -6,15 +6,17 @@ ifeq (i386,$(ARCH))
 TARGET  = cpubench-intel
 else
 TARGET  = cpubench-ppc
-# Подстраховка для сборки на не-младшем тулчейне (Leopard-ppc и т.п.):
-# force_cpusubtype_ALL даёт подтип ppc/ALL — как у канонических Tiger-сборок.
-LDFLAGS = -Wl,-force_cpusubtype_ALL
+# G3-safe обязателен: два слоя. 1) -mcpu=G3 — набор инструкций и шедулер
+# (без него тулчейн дефолтится на G4/G5-класс); 2) force_cpusubtype_ALL —
+# подтип Mach-O ppc/ALL (Leopard-дефолт ppc7400 на G3 не грузится).
+# Результат: один бинарь честно одинаковый на G3/G4/G5 (скилл ppc-build).
+TARGET_FLAGS = -mcpu=G3 -Wl,-force_cpusubtype_ALL
 endif
 
 all: $(TARGET)
 
 $(TARGET): cpubench.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) cpubench.c
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(TARGET) cpubench.c
 
 clean:
 	rm -f cpubench-ppc cpubench-intel cpubench

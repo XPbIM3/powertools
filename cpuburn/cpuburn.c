@@ -28,8 +28,28 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 /* NOTE: Apple gcc 4.0 provides AltiVec builtins under -faltivec;
    /usr/lib/.../altivec.h must NOT be included (it self-disables there). */
+
+/* AltiVec is a RUNTIME MODE, not a build target: the binary is built
+   G3-safe (-mcpu=G3 drives the scalar parts; subtype ppc/ALL), so it
+   loads on every G3..G5; VA instructions are reachable only behind
+   has_altivec(). On a G3: -m vec refuses up front, -m mixed silently
+   runs fp+int+mem. Verified hw.optional.altivec exists on 10.4/10.5. */
+static int has_altivec(void)
+{
+#if defined(__ppc__)
+    int    v = 0;
+    size_t len = sizeof v;
+    return sysctlbyname("hw.optional.altivec", &v, &len, NULL, 0) == 0 && v;
+#else
+    return 0;
+#endif
+}
+
+static int g_va = 0;     /* set once in main, before threads start */
 
 #define MEM_LEN      (8u << 20)                    /* 8 MB per thread */
 #define MEM_STEP     (64u << 10)                   /* advance 64 KB */
@@ -318,17 +338,22 @@ static double run_mode(burn_thread_t *t, double budget)
     switch (t->mode) {
     case MODE_FP:   return run_fp(t, budget);
     case MODE_INT:  return run_int(t, budget);
-    case MODE_VEC:  return run_vec(t, budget);
     case MODE_MEM:  return run_mem(t, budget);
+    case MODE_VEC:
+        if (g_va)
+            return run_vec(t, budget);
+        break;                       /* belt: main already refused this */
     default: break;
     }
 
-    /* mixed: alternate all kernels in small batches */
+    /* mixed: alternate kernels in small batches; without AltiVec
+       (G3) the vec block is dropped and mixed = fp + int + mem */
     t0 = now_us();
     for (;;) {
         fp_block(t, 4);
         int_block(t, 2);
-        vec_block(t, 2);
+        if (g_va)
+            vec_block(t, 2);
         if ((n & 31) == 0)
             mem_block(t);
         n++;
@@ -405,6 +430,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "cpuburn: -t must be 0..86400 s\n");
         return 1;
     }
+
+    g_va = has_altivec();
+    if (!g_va && mode == MODE_VEC) {
+        fprintf(stderr, "cpuburn: no AltiVec on this machine (G3-class?); "
+                        "-m vec needs a G4/G5 - try -m fp/int/mem\n");
+        return 1;
+    }
+    if (!g_va && mode == MODE_MIXED)
+        fprintf(stderr, "cpuburn: no AltiVec (G3-class?); "
+                        "mixed runs fp+int+mem, vec block dropped\n");
 
     pt = (pthread_t *)calloc((size_t)nthreads, sizeof(pthread_t));
     th = (burn_thread_t *)calloc((size_t)nthreads, sizeof(burn_thread_t));

@@ -37,9 +37,16 @@ cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
 ## Сборка
 
 - **ОС:** Mac OS X 10.4.11 (Tiger), iMac G5 PowerPC
-- **Тулчейн:** Xcode 2.5 11 GCC 4.0.1
-- Флаги: `-std=gnu99 -O2 -Wall -faltivec` (AltiVec builtins включены)
-- Сборка: 0 warnings
+- **Тулчейн:** канон парка — ibook-g4-1ghz, Tiger 10.4 (gcc 4.0.1 darwin8
+  build 5370); сборка 0 warnings
+- Флаги: `-std=gnu99 -O2 -Wall -faltivec` + G3-safe два слоя
+  `-mcpu=G3 -Wl,-force_cpusubtype_ALL` (скилл ppc-build): скалярные части
+  собираются под 750, подтип Mach-O = ppc/ALL
+- **AltiVec — runtime-режим, не цель сборки:** бинарь грузится на G3..G5;
+  VA-инструкции живут только за guard'ом `sysctl hw.optional.altivec`:
+  на G3 `-m vec` отказывает с понятным сообщением, `-m mixed` молча
+  деградирует до fp+int+mem (vec-блок опускается). На G4/G5 все режимы
+  работают как прежде.
 
 ```sh
 ssh tiger
