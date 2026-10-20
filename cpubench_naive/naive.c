@@ -90,11 +90,26 @@ static void print_machine(void)
     }
 #else
     {
+        /* Constants verified against /usr/include/mach/machine.h
+         * (Tiger 10.4): 60x=1..8, 750=9, 7400=10, 7450=11, 970=100. */
         int st = -1;
         size_t slen = sizeof st;
-        if (sysctlbyname("hw.cpusubtype", &st, &slen, NULL, 0) == 0)
-            printf("cpu:     PowerPC subtype %d\n", st);
-        else
+        const char *gen = NULL, *fam = NULL;
+
+        if (sysctlbyname("hw.cpusubtype", &st, &slen, NULL, 0) == 0) {
+            switch (st) {
+            case  9:  gen = "G3"; fam = "750";         break;
+            case 10:  gen = "G4"; fam = "7400";        break;
+            case 11:  gen = "G4"; fam = "7450 family"; break;
+            case 100: gen = "G5"; fam = "970";         break;
+            }
+        }
+        if (st >= 0) {
+            if (gen)
+                printf("cpu:     %s (%s, subtype %d)\n", gen, fam, st);
+            else
+                printf("cpu:     PowerPC (subtype %d)\n", st);
+        } else
             printf("cpu:     PowerPC\n");
     }
 #endif
@@ -115,7 +130,7 @@ int main(int argc, char **argv)
         budget = atof(argv[2]);
     } else if (argc == 3 && strcmp(argv[1], "-n") == 0) {
         n_fixed = strtoull(argv[2], NULL, 0);
-        n_fixed = (n_fixed / CHUNK + 1) * CHUNK;   /* whole chunks only */
+        n_fixed = (n_fixed + CHUNK - 1) / CHUNK * CHUNK; /* whole chunks */
     } else if (argc != 1) {
         fprintf(stderr, "usage: naive [-t seconds | -n passes]\n");
         return 1;

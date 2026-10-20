@@ -59,7 +59,7 @@ syscall ~1 мкс, а пасс на `-O0` — сопоставимая цена,
 
 ```
 machine: PowerBook5,6
-cpu:     PowerPC subtype 10            (на Intel: brand string)
+cpu:     G4 (7450 family, subtype 11)  (на Intel: brand string)
 freq:    1670 MHz
 naive -O0: FP 10s + INT 10s, 8 lanes, 16 ops/pass, chunk 1024
 
