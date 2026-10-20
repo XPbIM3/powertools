@@ -14,14 +14,16 @@
  *                 fused multiply-add; pass = 16 FMADD = 32 flop.
  *          Intel: 8 classic chains (a = a*x + 0.5) - separate mul+add (there
  *                 is no FMA in this CPU era); pass = 16 flop.
- *                 Chosen over a wider "mul/add ladder" ambulance: measured
- *                 best on the machine (clause sweep, see readme). All forms
- *                 compile memory-fed with gcc 4.0.1 i386 at -O2 (disasm
- *                 audited); "register-clean" is a PPC property of the code,
- *                 on Intel the metric counts the compiler's best C99 shape.
+ *          Both hot paths are REGISTER-CLEAN, verified by disasm audit
+ *          (accumulators as local scalars; struct-indexed forms compile
+ *          memory-fed on this era of gcc and were rejected - the PPC one
+ *          pinned G4 at its 1-LSU ceiling, historical passports measured
+ *          that LSU-bound variant).
  *
  *   INT  - integer ALU throughput: 4 xorshift32 chains (xor/shift only,
  *          1-cycle latency ops). One pass = 8 rounds x 4 lanes x 6 ops.
+ *          Lanes stay in registers for the whole call (state folded once
+ *          per call; round-reload form measured ALU + memory roundtrip).
  *          Identical kernel on both architectures.
  *
  * Scheme (why there is no "random ops" inside the timed loop):
@@ -149,38 +151,50 @@ typedef struct {
     unsigned long long passes;
 } bench_t;
 
-/* 16 independent FMADD chains; gcc 4.0.1 (-O2) folds a*x+.5 into fmadd */
-#define FP_PASS(t) \
-    ((t)->fa[0]  = (t)->fa[0]  * x + 0.5, (t)->fa[1]  = (t)->fa[1]  * x + 0.5, \
-     (t)->fa[2]  = (t)->fa[2]  * x + 0.5, (t)->fa[3]  = (t)->fa[3]  * x + 0.5, \
-     (t)->fa[4]  = (t)->fa[4]  * x + 0.5, (t)->fa[5]  = (t)->fa[5]  * x + 0.5, \
-     (t)->fa[6]  = (t)->fa[6]  * x + 0.5, (t)->fa[7]  = (t)->fa[7]  * x + 0.5, \
-     (t)->fa[8]  = (t)->fa[8]  * x + 0.5, (t)->fa[9]  = (t)->fa[9]  * x + 0.5, \
-     (t)->fa[10] = (t)->fa[10] * x + 0.5, (t)->fa[11] = (t)->fa[11] * x + 0.5, \
-     (t)->fa[12] = (t)->fa[12] * x + 0.5, (t)->fa[13] = (t)->fa[13] * x + 0.5, \
-     (t)->fa[14] = (t)->fa[14] * x + 0.5, (t)->fa[15] = (t)->fa[15] * x + 0.5)
-
+/* 16 independent FMADD chains as LOCAL SCALARS: one state load/store set
+   per call, hot pass is pure regs. The old struct-indexed form compiled
+   to lfd+fmadd+stfd interleave (LSU-bound: G4 pegged at its 1-LSU ceiling
+   ~0.5 flop/cycle; historical passports measured that) - register-clean
+   measured ~2x higher on G4-class and matches the Intel kernel discipline. */
 static void fp_run(bench_t *t, unsigned long long passes)
 {
+    double a0, a1, a2, a3, a4, a5, a6, a7,
+           a8, a9, a10, a11, a12, a13, a14, a15;
     double x = t->fx;
     unsigned long long p;
 
+    a0 = t->fa[0];  a1 = t->fa[1];  a2 = t->fa[2];  a3 = t->fa[3];
+    a4 = t->fa[4];  a5 = t->fa[5];  a6 = t->fa[6];  a7 = t->fa[7];
+    a8 = t->fa[8];  a9 = t->fa[9];  a10 = t->fa[10]; a11 = t->fa[11];
+    a12 = t->fa[12]; a13 = t->fa[13]; a14 = t->fa[14]; a15 = t->fa[15];
+
     for (p = 0; p < passes; p++) {
-        FP_PASS(t);
-        x += 0.03125;
-        if (x > 16.0) {                    /* recycle: keep doubles finite */
-            int k;
+        a0  = a0  * x + 0.5; a1  = a1  * x + 0.5;
+        a2  = a2  * x + 0.5; a3  = a3  * x + 0.5;
+        a4  = a4  * x + 0.5; a5  = a5  * x + 0.5;
+        a6  = a6  * x + 0.5; a7  = a7  * x + 0.5;
+        a8  = a8  * x + 0.5; a9  = a9  * x + 0.5;
+        a10 = a10 * x + 0.5; a11 = a11 * x + 0.5;
+        a12 = a12 * x + 0.5; a13 = a13 * x + 0.5;
+        a14 = a14 * x + 0.5; a15 = a15 * x + 0.5;
+        x += 0.01;
+        if (x > 2.0) {                    /* recycle: keep doubles finite */
             x = 1.0;
-            for (k = 0; k < 16; k++)
-                t->fa[k] = (double)k;
+            a0 = 0; a1 = 1; a2 = 2; a3 = 3; a4 = 4; a5 = 5;
+            a6 = 6; a7 = 7; a8 = 8; a9 = 9; a10 = 10; a11 = 11;
+            a12 = 12; a13 = 13; a14 = 14; a15 = 15;
         }
     }
+    t->fa[0]  = a0;  t->fa[1]  = a1;  t->fa[2]  = a2;  t->fa[3]  = a3;
+    t->fa[4]  = a4;  t->fa[5]  = a5;  t->fa[6]  = a6;  t->fa[7]  = a7;
+    t->fa[8]  = a8;  t->fa[9]  = a9;  t->fa[10] = a10; t->fa[11] = a11;
+    t->fa[12] = a12; t->fa[13] = a13; t->fa[14] = a14; t->fa[15] = a15;
     t->fx = x;
     t->passes += passes;
-    t->check += (unsigned long long)(t->fa[0] + t->fa[1] + t->fa[2] + t->fa[3]
-                                   + t->fa[4] + t->fa[5] + t->fa[6] + t->fa[7]
-                                   + t->fa[8] + t->fa[9] + t->fa[10] + t->fa[11]
-                                   + t->fa[12] + t->fa[13] + t->fa[14] + t->fa[15]);
+    t->check += (unsigned long long)(a0 + a1 + a2 + a3
+                                   + a4 + a5 + a6 + a7
+                                   + a8 + a9 + a10 + a11
+                                   + a12 + a13 + a14 + a15);
 }
 
 #else /* ARCH_INTEL */
@@ -193,8 +207,10 @@ typedef struct {
     unsigned long long passes;
 } bench_t;
 
-/* 8 classic chains; x drifts per invocation, accumulators recycle on a
-   pass counter (mount-free: growth 1.001^65536 ~ 1e28 stays finite).
+/* 8 classic chains; x fixed by invocation (drift +0.0005 per call),
+   accumulators recycle every 16384 passes: growth bound for the window
+   is 0.5*(x^16384 - 1)/(x - 1) ~ 7e9 - FINITE and far below the
+   unsigned long long range (65536 gave ~3e31: fold cast was UB).
    Local scalars on purpose: gcc 4.0.1 i386 keeps struct-pointer-indexed
    doubles memory-fed (audited), scalars go to xmm registers. */
 static void fp_run(bench_t *t, unsigned long long passes)
@@ -210,7 +226,7 @@ static void fp_run(bench_t *t, unsigned long long passes)
         a2 = a2 * x + 0.5; a3 = a3 * x + 0.5;
         a4 = a4 * x + 0.5; a5 = a5 * x + 0.5;
         a6 = a6 * x + 0.5; a7 = a7 * x + 0.5;
-        if ((p & 65535ULL) == 65535ULL) {
+        if ((p & 16383ULL) == 16383ULL) {
             a0 = 0; a1 = 1; a2 = 2; a3 = 3;
             a4 = 4; a5 = 5; a6 = 6; a7 = 7;
         }
@@ -228,25 +244,29 @@ static void fp_run(bench_t *t, unsigned long long passes)
 /* ------------------------------------------------------------- INT */
 
 /* 4 xorshift32 lanes; one pass = 8 rounds x 4 lanes x 6 ALU ops (192).
-   Same kernel on both architectures. */
+   Same kernel on both architectures. The lanes live in registers for the
+   WHOLE call (one state load/store per call, not per round): the old
+   round-reload form measured an ALU + memory roundtrip rate - on i386
+   it cost ~17% (disasm-audited: per-round movl 0x48(%ecx)/movl stack
+   stores). xorshift math is location-free, so checksums are unchanged. */
 static void int_run(bench_t *t, unsigned long long passes)
 {
     unsigned long long p;
+    unsigned int       a, b, c, d;
     int                k;
 
+    a = t->ia[0]; b = t->ia[1]; c = t->ia[2]; d = t->ia[3];
     for (p = 0; p < passes; p++)
         for (k = 0; k < 8; k++) {
-            unsigned int a = t->ia[0], b = t->ia[1];
-            unsigned int c = t->ia[2], d = t->ia[3];
             a ^= a << 13; a ^= a >> 17; a ^= a << 5;
             b ^= b << 11; b ^= b >> 21; b ^= b << 4;
             c ^= c << 17; c ^= c >> 15; c ^= c << 8;
             d ^= d << 7;  d ^= d >> 12; d ^= d << 23;
-            t->ia[0] = a; t->ia[1] = b; t->ia[2] = c; t->ia[3] = d;
         }
+    t->ia[0] = a; t->ia[1] = b; t->ia[2] = c; t->ia[3] = d;
     t->passes += passes;
-    t->check ^= ((unsigned long long)t->ia[0] << 32) ^ t->ia[1]
-              ^ ((unsigned long long)t->ia[2] << 16) ^ (t->ia[3] * 2246822519u);
+    t->check ^= ((unsigned long long)a << 32) ^ b
+              ^ ((unsigned long long)c << 16) ^ (d * 2246822519u);
 }
 
 /* ------------------------------------------------------------ driver */
@@ -303,7 +323,7 @@ static void phase(kern_fn run, bench_t *t, double secs,
 #define PROG_TITLE  "cpubench-ppc (PowerPC Mac OS X 10.4/10.5)"
 #define PROG_USAGE  "cpubench-ppc"
 #define FLOPS_PER_PASS 32.0     /* 16 FMADD x (mul+add) */
-#define PASSES_UNIT    "FMADD"
+#define PASSES_UNIT    "chain-steps"
 #define OPS_LABEL      "billion FMADD/s"
 #define OPS_PER_PASS   16.0
 #define FLOP_NOTE      "(fused mul+add counted, double 64-bit)"
@@ -311,7 +331,7 @@ static void phase(kern_fn run, bench_t *t, double secs,
 #define PROG_TITLE  "cpubench-intel (Intel Mac OS X 10.5, 32-bit)"
 #define PROG_USAGE  "cpubench-intel"
 #define FLOPS_PER_PASS 16.0     /* 8 chains x (mul+add) */
-#define PASSES_UNIT    "mul+add"
+#define PASSES_UNIT    "chain-steps"
 #define OPS_LABEL      "billion mul+add/s"
 #define OPS_PER_PASS   16.0
 #define FLOP_NOTE      "(mul+add counted, separate ops - no FMA on this CPU)"
@@ -379,7 +399,8 @@ int main(int argc, char **argv)
 
     printf(PROG_TITLE "\n");
     print_cpu();
-    printf("phases: FP %.1f s + INT %.1f s (chunks + warmup, ~%.1f s total)\n\n",
+    printf("phases: FP %.1f s + INT %.1f s"
+           " (chunks + warmup, ~%.1f s total)\n\n",
            secs, secs, 2.0 * secs + 1.5);
 
     /* ---------- FP phase ---------- */
