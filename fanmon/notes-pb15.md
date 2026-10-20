@@ -34,7 +34,9 @@ ssh: алиас `pb15-g4-leopard`, ключ установлен (expect, пар
    iBook), температуры CPU/CPU-INTREPID/PWR SUPPLY/BATT-TEMP/TRACKPAD,
    CPU CORE 1.32 В, BATT-CURRENT сенсор. Интересно: TRACKPAD-сенсор
    13.5 C — холодный пад, реальный тайп.
-4. cpubench: Leopard HW_CPU_FREQ ×2³² quirk отработан (модель
+4. cpubench (тогдашний -O2 бенчмарк, снят с поддержки 21.10.2026 в
+   пользу `cpubench_naive`; приведённые цифры — история, не эталон):
+   Leopard HW_CPU_FREQ ×2³² quirk отработан (модель
    «PowerBook5,6, 1666 MHz» — правильная). FP 0.778 GFLOP/s (0.39 млрд
    FMADD/s), INT 2.55 млрд ALU ops/s — ровно ×2 против iBook G4 1.07
    ГГц на той же 7447a архитектуре (0.389 / 1.28). По тактам:
