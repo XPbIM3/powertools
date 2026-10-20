@@ -43,15 +43,22 @@
  *     the -O0 loop bookkeeping ("dirty latency", same rules everywhere).
  *   - one warm pass runs untimed before each phase (page faults of the
  *     first touch on small-RAM machines stay out of the measurement).
- *   - buffers: 2 x 64 MB (~128 MB peak - fine on a 384 MB machine when
- *     measured quiet). Alloc failure -> honest skip, FP/INT untouched.
+ *   - buffers: 2 x 64 MB by default (sum 128 MB peak - fine on a 384 MB
+ *     machine when measured quiet). Alloc failure -> honest skip, FP/INT
+ *     untouched.
+ *   - key -w MB: total size of BOTH buffers (each = MB/2), default 128.
+ *     For small-RAM machines (e.g. -w 64 -> 2 x 32 MB buffers, the full
+ *     walk covers half the nodes). CHANGING -w CHANGES THE MEM CHECKSUM
+ *     (different copy pattern / shuffle size) - a proof run pins it.
+ *     FP/INT checksums do NOT depend on -w.
  *
  * -t mode measures the rate; pass counts (and hence checksums) differ per
  * machine. -n mode runs an exact pass count: checksums then are the
  * cross-machine proof that "the same rules" executed everywhere.
  *
- * usage: naive [-t seconds | -n passes]   (default: -t 10 per phase;
- * -n also pins MEM to 32 copy passes + the always-fixed full walk)
+ * usage: naive [-t seconds | -n passes] [-w MB]
+ * (default: -t 10 per phase; -n also pins MEM to 32 copy passes +
+ * the always-fixed full walk)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,20 +152,35 @@ int main(int argc, char **argv)
     unsigned long long fp_passes = 0, int_passes = 0, mhz;
     unsigned long long fpchk = 0, intchk = 0, fpops, intops, n_fixed = 0;
     unsigned long long mem_passes = 0, copychk = 0, walkchk = 0;
+    unsigned long long wtotal_mb = 128;   /* -w: BOTH buffers, default 128 */
     double budget = 10.0, t0, tf, ti, mt = 0, mt2 = 0;
+    unsigned long wbytes = MEM_BYTES;     /* one buffer, bytes */
+    unsigned mw = MEM_WORDS;              /* one buffer, words */
     unsigned *msrc = NULL, *mdst = NULL;
-    int mem_ok = 0;
+    int mem_ok = 0, i;
     union { double d; unsigned long long u; } cv;
 
-    if (argc == 3 && strcmp(argv[1], "-t") == 0 && atof(argv[2]) > 0) {
-        budget = atof(argv[2]);
-    } else if (argc == 3 && strcmp(argv[1], "-n") == 0) {
-        n_fixed = strtoull(argv[2], NULL, 0);
-        n_fixed = (n_fixed + CHUNK - 1) / CHUNK * CHUNK; /* whole chunks */
-    } else if (argc != 1) {
-        fprintf(stderr, "usage: naive [-t seconds | -n passes]\n");
-        return 1;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-t") == 0 && i + 1 < argc && atof(argv[i + 1]) > 0)
+            budget = atof(argv[++i]);
+        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+            n_fixed = strtoull(argv[++i], NULL, 0);
+            n_fixed = (n_fixed + CHUNK - 1) / CHUNK * CHUNK; /* whole chunks */
+        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            wtotal_mb = strtoull(argv[++i], NULL, 0);
+            if (wtotal_mb < 2 || wtotal_mb > 1024) {
+                fprintf(stderr, "usage: naive [-t seconds | -n passes] "
+                        "[-w MB 2..1024]\n");
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "usage: naive [-t seconds | -n passes] "
+                    "[-w MB 2..1024]\n");
+            return 1;
+        }
     }
+    wbytes = (unsigned long)(wtotal_mb / 2) * 1024UL * 1024UL;
+    mw = (unsigned)(wbytes / sizeof (unsigned));
 
     for (k = 0; k < NL; k++) {
         x[k] = 0.5 + (double)(k + 1) * 1e-9;
@@ -169,12 +191,14 @@ int main(int argc, char **argv)
     print_machine();
     if (n_fixed)
         printf("naive -O0: -n %llu passes per phase, %d lanes, "
-               "%d ops/pass (+MEM %d copy passes / full walk)\n\n",
-               n_fixed, NL, OPS_PER_PASS, MEM_N_PASSES);
+               "%d ops/pass (+MEM %d copy passes / full walk, "
+               "%lux2 MB)\n\n", n_fixed, NL, OPS_PER_PASS, MEM_N_PASSES,
+               wbytes / (1024 * 1024));
     else
         printf("naive -O0: FP %.0fs + INT %.0fs + MEM copy %.0fs + walk, "
-               "%d lanes, %d ops/pass, chunk %d\n\n", budget, budget,
-               budget, NL, OPS_PER_PASS, CHUNK);
+               "%d lanes, %d ops/pass, chunk %d, MEM %lux2 MB\n\n",
+               budget, budget, budget, NL, OPS_PER_PASS, CHUNK,
+               wbytes / (1024 * 1024));
 
     t0 = now();
     do {
@@ -194,44 +218,44 @@ int main(int argc, char **argv)
     } while (n_fixed ? int_passes < n_fixed : !timed_out(t0, budget));
     ti = now() - t0;
 
-    /* ---- MEM phase: 64 MB RAM-tier copy + full permuted walk ---- */
-    msrc = malloc(MEM_BYTES);
-    mdst = malloc(MEM_BYTES);
+    /* ---- MEM phase: RAM-tier copy + full permuted walk ---- */
+    msrc = malloc(wbytes);
+    mdst = malloc(wbytes);
     if (!msrc || !mdst) {
         free(msrc);
         free(mdst);
         msrc = mdst = NULL;
-        printf("  MEM: skipped - %lu MB buffers not available\n",
-               MEM_BYTES / (1024 * 1024));
+        printf("  MEM: skipped - 2 x %lu MB buffers not available\n",
+               wbytes / (1024 * 1024));
     } else {
         unsigned seed = 0x9E3779B9u, j, tmp;
         unsigned long i, h;      /* h: the walk hop / word index */
 
         /* src fill (deterministic LCG) + one untimed warm copy pass,
          * so page faults of the first touch stay out of the timing */
-        for (i = 0; i < MEM_WORDS; i++)
+        for (i = 0; i < mw; i++)
             msrc[i] = seed = seed * 1664526u + 1013904223u;
-        for (i = 0; i < MEM_WORDS; i++)
+        for (i = 0; i < mw; i++)
             mdst[i] = msrc[i];
 
         t0 = now();
         mem_passes = 0;
         do {                     /* naive copy, clock once per pass */
-            for (i = 0; i < MEM_WORDS; i++)
+            for (i = 0; i < mw; i++)
                 mdst[i] = msrc[i];
             mem_passes++;
         } while (n_fixed ? mem_passes < MEM_N_PASSES
                          : !timed_out(t0, budget));
         mt = now() - t0;
 
-        for (i = 0; i < MEM_WORDS; i++)      /* proof of real copy */
+        for (i = 0; i < mw; i++)             /* proof of real copy */
             copychk ^= mdst[i];
 
         /* latency: Sattolo shuffle (single cycle) over node index,
          * built in-place in msrc (untimed), then one full walk */
-        for (i = 0; i < MEM_WORDS; i++)
+        for (i = 0; i < mw; i++)
             msrc[i] = (unsigned)i;
-        for (i = MEM_WORDS - 1; i > 0; i--) {
+        for (i = mw - 1; i > 0; i--) {
             seed = seed * 1664526u + 1013904223u;
             j = seed % (unsigned)i;          /* Sattolo: j in [0, i-1] */
             tmp = msrc[i];
@@ -247,7 +271,7 @@ int main(int argc, char **argv)
             if ((h & 4095u) == 4095u)
                 walkchk ^= (unsigned long long)p;
             h++;
-        } while (h < MEM_WORDS);
+        } while (h < mw);
         mt2 = now() - t0;
         if (p != 0)
             printf("  MEM: WARNING single-cycle walk left p=%u - "
@@ -279,12 +303,11 @@ int main(int argc, char **argv)
         printf("  checksum: fp %016llx  int %016llx\n", fpchk, intchk);
         return 0;
     }
-    printf("  MEM: %7.1f MB/s   copy %6.2f s %12llu passes (64M window)\n",
-           (double)mem_passes * (double)MEM_BYTES / mt / 1e6, mt,
-           mem_passes);
-    printf("  MEM: %7.1f ns/hop     %6.2f s %12llu hops   (full walk)\n",
-           mt2 * 1e9 / (double)MEM_WORDS, mt2,
-           (unsigned long long)MEM_WORDS);
+    printf("  MEM: %7.1f MB/s   copy %6.2f s %12llu passes (%luM window)\n",
+           (double)mem_passes * (double)wbytes / mt / 1e6, mt,
+           mem_passes, wbytes / (1024 * 1024));
+    printf("  MEM: %7.1f ns/hop     %6.2f s %12lu hops   (full walk)\n",
+           mt2 * 1e9 / (double)mw, mt2, (unsigned long)mw);
     printf("  checksum: fp %016llx  int %016llx  mem %016llx\n",
            fpchk, intchk, copychk ^ walkchk);
     return 0;
