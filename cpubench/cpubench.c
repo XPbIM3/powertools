@@ -12,13 +12,16 @@
  *   FP   - scalar double-precision floating point throughput.
  *          PPC:   16 independent FMADD chains (a = a*x + 0.5) - the native
  *                 fused multiply-add; pass = 16 FMADD = 32 flop.
- *          Intel: 8 classic chains (a = a*x + 0.5) - separate mul+add (there
- *                 is no FMA in this CPU era); pass = 16 flop.
- *          Both hot paths are REGISTER-CLEAN, verified by disasm audit
+ *          Intel: 6 classic chains (a = a*x + 0.5) - separate mul+add (there
+ *                 is no FMA in this CPU era); pass = 6 (mul+add) = 12 flop.
+ *          Both hot paths are REGISTER-RESIDENT, verified by disasm audit
  *          (accumulators as local scalars; struct-indexed forms compile
  *          memory-fed on this era of gcc and were rejected - the PPC one
  *          pinned G4 at its 1-LSU ceiling, historical passports measured
- *          that LSU-bound variant).
+ *          that LSU-bound variant). Intel chain count is the largest
+ *          that fits the 8 xmm regs together with x + the 0.5 addend:
+ *          an 8-chain shape spilled 3 chains to stack per pass and lost
+ *          ~6.5% (disasm-quantified, probe6, 20.10.2026).
  *
  *   INT  - integer ALU throughput: 4 xorshift32 chains (xor/shift only,
  *          1-cycle latency ops). One pass = 8 rounds x 4 lanes x 6 ops.
@@ -200,43 +203,42 @@ static void fp_run(bench_t *t, unsigned long long passes)
 #else /* ARCH_INTEL */
 
 typedef struct {
-    double           fa[8];    /* 8 classic chains, all fit the 8 xmm regs */
+    double           fa[6];    /* 6 chains: 6 acc + x + 0.5 = 8/8 xmm regs */
     double           fx;
     unsigned int     ia[4];
     unsigned long long check;
     unsigned long long passes;
 } bench_t;
 
-/* 8 classic chains; x fixed by invocation (drift +0.0005 per call),
+/* 6 classic chains; x fixed by invocation (drift +0.0005 per call),
    accumulators recycle every 16384 passes: growth bound for the window
    is 0.5*(x^16384 - 1)/(x - 1) ~ 7e9 - FINITE and far below the
    unsigned long long range (65536 gave ~3e31: fold cast was UB).
-   Local scalars on purpose: gcc 4.0.1 i386 keeps struct-pointer-indexed
-   doubles memory-fed (audited), scalars go to xmm registers. */
+   Local scalars on purpose: gcc 4.0.1 i386 pushes struct-pointer-indexed
+   doubles memory-fed, AND 8 chains did not fit the 8 xmm (x + 0.5 take
+   two) - 3 chains stack-fed per pass, ~6.5% lost (disasm-quantified);
+   6 chains compile fully register-resident (audited). */
 static void fp_run(bench_t *t, unsigned long long passes)
 {
-    double a0, a1, a2, a3, a4, a5, a6, a7;
+    double a0, a1, a2, a3, a4, a5;
     double x = t->fx;
     unsigned long long p;
 
-    a0 = t->fa[0]; a1 = t->fa[1]; a2 = t->fa[2]; a3 = t->fa[3];
-    a4 = t->fa[4]; a5 = t->fa[5]; a6 = t->fa[6]; a7 = t->fa[7];
+    a0 = t->fa[0]; a1 = t->fa[1]; a2 = t->fa[2];
+    a3 = t->fa[3]; a4 = t->fa[4]; a5 = t->fa[5];
     for (p = 0; p < passes; p++) {
         a0 = a0 * x + 0.5; a1 = a1 * x + 0.5;
         a2 = a2 * x + 0.5; a3 = a3 * x + 0.5;
         a4 = a4 * x + 0.5; a5 = a5 * x + 0.5;
-        a6 = a6 * x + 0.5; a7 = a7 * x + 0.5;
         if ((p & 16383ULL) == 16383ULL) {
-            a0 = 0; a1 = 1; a2 = 2; a3 = 3;
-            a4 = 4; a5 = 5; a6 = 6; a7 = 7;
+            a0 = 0; a1 = 1; a2 = 2; a3 = 3; a4 = 4; a5 = 5;
         }
     }
-    t->fa[0] = a0; t->fa[1] = a1; t->fa[2] = a2; t->fa[3] = a3;
-    t->fa[4] = a4; t->fa[5] = a5; t->fa[6] = a6; t->fa[7] = a7;
+    t->fa[0] = a0; t->fa[1] = a1; t->fa[2] = a2;
+    t->fa[3] = a3; t->fa[4] = a4; t->fa[5] = a5;
     t->fx = x + 0.0005;                 /* tiny per-invocation drift */
     t->passes += passes;
-    t->check += (unsigned long long)(a0 + a1 + a2 + a3
-                                   + a4 + a5 + a6 + a7);
+    t->check += (unsigned long long)(a0 + a1 + a2 + a3 + a4 + a5);
 }
 
 #endif /* ARCH_PPC */
@@ -330,10 +332,10 @@ static void phase(kern_fn run, bench_t *t, double secs,
 #else /* ARCH_INTEL */
 #define PROG_TITLE  "cpubench-intel (Intel Mac OS X 10.5, 32-bit)"
 #define PROG_USAGE  "cpubench-intel"
-#define FLOPS_PER_PASS 16.0     /* 8 chains x (mul+add) */
+#define FLOPS_PER_PASS 12.0     /* 6 chains x (mul+add) */
 #define PASSES_UNIT    "chain-steps"
 #define OPS_LABEL      "billion mul+add/s"
-#define OPS_PER_PASS   16.0
+#define OPS_PER_PASS   12.0
 #define FLOP_NOTE      "(mul+add counted, separate ops - no FMA on this CPU)"
 #endif
 
@@ -385,7 +387,7 @@ int main(int argc, char **argv)
 #else
     {
         int k;
-        for (k = 0; k < 8; k++)
+        for (k = 0; k < 6; k++)
             t.fa[k] = (double)k;
     }
 #endif
