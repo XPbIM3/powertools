@@ -76,3 +76,7 @@ instance — libgcc `___udivdi3` для вывода rates, целочислен
 - Очередь: G5/G3 и остальные машины парка — артефакт `naive-ppc`
   универсален (`ppc/ALL`), запускается без пересборки при первом выходе
   машин онлайн.
+- Фикстуры обеих обмеренных машин сняты тем же визитом 21.10.2026
+  (`fixtures/hwshot.sh`): `hwshot-PowerBook6,5-10.4.11.txt.gz` (Tiger,
+  7450-family, 384 МБ RAM), `hwshot-MacBookPro3,1-10.5.8.txt.gz`
+  (Leopard i386, Core 2 T7700).
