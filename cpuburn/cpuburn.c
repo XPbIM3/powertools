@@ -4,10 +4,10 @@
  * Standalone: knows nothing about any monitoring tools. It just burns.
  *
  * Design rules for the 970/G4 era:
- *   - the hot loop must keep ALL pipelines busy: 2 FPU (FMADD), 2
- *     integer ALU, vector (AltiVec) and the load/store unit. A pure
- *     dependency-chained FP loop stalls the machine into a low-power
- *     state and heats nothing.
+ *   - the hot loop must keep ALL scalar pipelines busy: 2 FPU (FMADD),
+ *     2 integer ALU and the load/store unit. A pure dependency-chained
+ *     FP loop stalls the machine into a low-power state and heats
+ *     nothing.
  *   - 16 independent double accumulators >> FP latency (~6 cyc)
  *   - integer work is xor/shift based (int mul has 4-5 cyc latency)
  *   - a rolling 8 MB buffer keeps the memory controller awake
@@ -17,10 +17,15 @@
  * Usage: cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
  *   -n N   threads (default 1; >1 oversubscribes single-core machines)
  *   -t S   duration in seconds (default 600 = 10 min)
- *   -m M   mode: fp | int | vec | mem | mixed (default mixed)
+ *   -m M   mode: fp | int | mem | mixed (default mixed)
  *
  * Always runs at normal priority and at full duty: no throttling,
  * no scheduling tricks - the whole point is to heat the machine.
+ *
+ * AltiVec REMOVED (decision 22.10.2026): the default state of this
+ * build is WITHOUT AltiVec - all VA code paths and the runtime guard
+ * are gone; the binary contains no VA instructions at all, G3-safe
+ * by both layers (-mcpu=G3, subtype ppc/ALL).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,26 +35,11 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
-/* NOTE: Apple gcc 4.0 provides AltiVec builtins under -faltivec;
-   /usr/lib/.../altivec.h must NOT be included (it self-disables there). */
 
-/* AltiVec is a RUNTIME MODE, not a build target: the binary is built
-   G3-safe (-mcpu=G3 drives the scalar parts; subtype ppc/ALL), so it
-   loads on every G3..G5; VA instructions are reachable only behind
-   has_altivec(). On a G3: -m vec refuses up front, -m mixed silently
-   runs fp+int+mem. Verified hw.optional.altivec exists on 10.4/10.5. */
-static int has_altivec(void)
-{
-#if defined(__ppc__)
-    int    v = 0;
-    size_t len = sizeof v;
-    return sysctlbyname("hw.optional.altivec", &v, &len, NULL, 0) == 0 && v;
-#else
-    return 0;
-#endif
-}
+/* NOTE (22.10.2026): AltiVec removed entirely - no builtins, no guard,
+ * no -faltivec. See the header note. */
 
-static int g_va = 0;     /* set once in main, before threads start */
+/* ------------------------------------------------------------ modes */
 
 #define MEM_LEN      (8u << 20)                    /* 8 MB per thread */
 #define MEM_STEP     (64u << 10)                   /* advance 64 KB */
@@ -58,11 +48,10 @@ static int g_va = 0;     /* set once in main, before threads start */
 
 #define MODE_FP      0
 #define MODE_INT     1
-#define MODE_VEC     2
-#define MODE_MEM     3
-#define MODE_MIXED   4
+#define MODE_MEM     2
+#define MODE_MIXED   3
 
-static const char *mode_names[] = { "fp", "int", "vec", "mem", "mixed" };
+static const char *mode_names[] = { "fp", "int", "mem", "mixed" };
 
 typedef struct {
     int            id;
@@ -78,12 +67,6 @@ typedef struct {
 
     /* int state: 4 independent xorshift32 chains */
     unsigned int   ia[4];
-
-    /* vector state */
-#if defined(__ppc__)
-    vector float   vv[4];
-#endif
-    float         *vbuf;                        /* 16-byte aligned */
 
     /* mem state */
     unsigned int  *mem;
@@ -226,70 +209,6 @@ static double run_int(burn_thread_t *t, double budget)
     return t1 - t0;
 }
 
-/* ---------------------------------------------------------- altivec */
-
-static void vec_block(burn_thread_t *t, int passes)
-{
-#if defined(__ppc__)
-    vector float v0 = t->vv[0], v1 = t->vv[1];
-    vector float v2 = t->vv[2], v3 = t->vv[3];
-    vector float vx, vh, vstep, vt;
-    float half[4] __attribute__((aligned(16))) = { 0.5f,    0.5f,    0.5f,    0.5f };
-    float step[4] __attribute__((aligned(16))) = { 0.0625f, 0.0625f, 0.0625f, 0.0625f };
-    float tmp[4] __attribute__((aligned(16)));
-    unsigned int u0, u1, u2, u3;
-    int p;
-
-    vx    = vec_ld(0, (vector float *)t->vbuf);      /* exercise the LSU */
-    vh    = vec_ld(0, (vector float *)half);
-    vstep = vec_ld(0, (vector float *)step);
-
-    for (p = 0; p < passes; p++) {
-        vt = vec_add(vx, vstep);
-        v0 = vec_madd(v0, vt, vh);
-        v1 = vec_madd(v1, vt, vh);
-        v2 = vec_madd(v2, vt, vh);
-        v3 = vec_madd(v3, vt, vh);
-        vx = vt;
-    }
-    t->vv[0] = v0; t->vv[1] = v1;
-    t->vv[2] = v2; t->vv[3] = v3;
-
-    vec_st(v0, 0, tmp);
-    u0 = *(unsigned int *)&tmp[0] ^ *(unsigned int *)&tmp[1];
-    vec_st(v1, 0, tmp);
-    u1 = *(unsigned int *)&tmp[0] ^ *(unsigned int *)&tmp[1];
-    vec_st(v2, 0, tmp);
-    u2 = *(unsigned int *)&tmp[0] ^ *(unsigned int *)&tmp[1];
-    vec_st(v3, 0, tmp);
-    u3 = *(unsigned int *)&tmp[0] ^ *(unsigned int *)&tmp[1];
-
-    t->check ^= ((unsigned long long)u0 << 16) ^ (u1 * 40503u)
-              ^ ((unsigned long long)u2 << 8) ^ u3;
-#else
-    (void)t; (void)passes;
-#endif
-}
-
-static double run_vec(burn_thread_t *t, double budget)
-{
-    double t0, t1;
-    unsigned long long pass = 0;
-
-    t0 = now_us();
-    for (;;) {
-        vec_block(t, 16);
-        pass += 16;
-        if ((pass & 31) == 0) {
-            t1 = now_us();
-            if (t1 - t0 >= budget)
-                break;
-        }
-    }
-    t1 = now_us();
-    return t1 - t0;
-}
-
 /* -------------------------------------------------------------- mem */
 
 static void mem_block(burn_thread_t *t)
@@ -339,21 +258,14 @@ static double run_mode(burn_thread_t *t, double budget)
     case MODE_FP:   return run_fp(t, budget);
     case MODE_INT:  return run_int(t, budget);
     case MODE_MEM:  return run_mem(t, budget);
-    case MODE_VEC:
-        if (g_va)
-            return run_vec(t, budget);
-        break;                       /* belt: main already refused this */
     default: break;
     }
 
-    /* mixed: alternate kernels in small batches; without AltiVec
-       (G3) the vec block is dropped and mixed = fp + int + mem */
+    /* mixed: alternate scalar kernels in small batches - fp + int + mem */
     t0 = now_us();
     for (;;) {
         fp_block(t, 4);
         int_block(t, 2);
-        if (g_va)
-            vec_block(t, 2);
         if ((n & 31) == 0)
             mem_block(t);
         n++;
@@ -387,7 +299,7 @@ static void usage(void)
            "  -n N   threads (default 1; >1 oversubscribes single-core)\n"
            "  -t S   duration in seconds (default 600 = 10 min)\n"
            "  -m M   mode: ");
-    for (i = 0; i < 5; i++)
+    for (i = 0; i < 4; i++)
         printf("%s%s", i ? "/" : "", mode_names[i]);
     printf(" (default mixed)\n"
            "  -h     this help\n\n"
@@ -402,14 +314,14 @@ int main(int argc, char **argv)
     double         start, end;
     pthread_t     *pt;
     burn_thread_t *th;
-    int            i, ch, mi = 5;
+    int            i, ch, mi = MODE_MIXED;
 
     while ((ch = getopt(argc, argv, "n:t:m:h")) != -1) {
         switch (ch) {
         case 'n': nthreads = atoi(optarg); break;
         case 't': duration = atof(optarg); break;
         case 'm':
-            for (mi = 4; mi >= 0; mi--)
+            for (mi = 3; mi >= 0; mi--)
                 if (strcmp(optarg, mode_names[mi]) == 0)
                     break;
             if (mi < 0) {
@@ -431,16 +343,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    g_va = has_altivec();
-    if (!g_va && mode == MODE_VEC) {
-        fprintf(stderr, "cpuburn: no AltiVec on this machine (G3-class?); "
-                        "-m vec needs a G4/G5 - try -m fp/int/mem\n");
-        return 1;
-    }
-    if (!g_va && mode == MODE_MIXED)
-        fprintf(stderr, "cpuburn: no AltiVec (G3-class?); "
-                        "mixed runs fp+int+mem, vec block dropped\n");
-
     pt = (pthread_t *)calloc((size_t)nthreads, sizeof(pthread_t));
     th = (burn_thread_t *)calloc((size_t)nthreads, sizeof(burn_thread_t));
     if (!pt || !th) {
@@ -458,21 +360,13 @@ int main(int argc, char **argv)
         t->ia[1] = 0x85EBCA77u - (unsigned)i;
         t->ia[2] = 0xC2B2AE35u + (unsigned)(i << 8);
         t->ia[3] = 0x27D4EB2Fu ^ (unsigned)(i << 16);
-        t->vbuf = (float *)valloc(4096);
         t->mem  = (unsigned int *)malloc(MEM_LEN);
-        if (!t->vbuf || !t->mem) {
+        if (!t->mem) {
             fprintf(stderr, "cpuburn: out of memory\n");
             return 1;
         }
-        memset(t->vbuf, 0, 4096);
         memset(t->mem, 0, MEM_LEN);
         t->mpos = (unsigned)i * (MEM_STEP / 4);
-#if defined(__ppc__)
-        t->vv[0] = (vector float)(1.0f, 2.0f, 3.0f, 4.0f);
-        t->vv[1] = (vector float)(1.1f, 2.2f, 3.3f, 4.4f);
-        t->vv[2] = (vector float)(1.2f, 2.3f, 3.4f, 4.5f);
-        t->vv[3] = (vector float)(1.3f, 2.4f, 3.5f, 4.6f);
-#endif
     }
 
     printf("cpuburn: mode=%s threads=%d duration=%.1f s\n",
@@ -507,7 +401,6 @@ int main(int argc, char **argv)
     }
 
     for (i = 0; i < nthreads; i++) {
-        free(th[i].vbuf);
         free(th[i].mem);
     }
     free(pt);

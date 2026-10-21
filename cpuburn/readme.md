@@ -5,13 +5,12 @@
 
 ## Идея нагрузки (под архитектуру G5)
 
-Процессор 970 суперскалярный (2 FPU + 2 ALU + LSU + AltiVec), поэтому
-загрузчик старается держать **все конвейеры занятыми одновременно**:
+Процессор 970 суперскалярный (2 FPU + 2 ALU + LSU), поэтому
+загрузчик старается держать **все скалярные конвейеры занятыми одновременно**:
 
 - 16 независимых `fmadd`-цепочек: a[i] = a[i]*x + 0.5 (latency FP ~6 циклов -
   длина 16 гарантированно перекрывает задержку, оба FPU не простаивают)
 - integer: 4 независимых xorshift32-цепочкиRolAt (xor/shift, latency 1 такт)
-- AltiVec: vfmadd-цепочки + vec_ld (LSU)
 - вращающийся буфер 8 МБ на поток (контроллер памяти)
 
 Каждое ядро собирает чексумму и печатает её в конце:
@@ -25,7 +24,7 @@
 cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
   -n N   число потоков (default 1; >1 = oversubscription одноядерных)
   -t S   длительность, секунд (default 600 = 10 мин)
-  -m M   режим fp | int | vec | mem | mixed (default mixed)
+  -m M   режим fp | int | mem | mixed (default mixed)
   -h     справка
 ```
 
@@ -39,14 +38,14 @@ cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
 - **ОС:** Mac OS X 10.4.11 (Tiger), iMac G5 PowerPC
 - **Тулчейн:** канон парка — ibook-g4-1ghz, Tiger 10.4 (gcc 4.0.1 darwin8
   build 5370); сборка 0 warnings
-- Флаги: `-std=gnu99 -O2 -Wall -faltivec` + G3-safe два слоя
+- Флаги: `-std=gnu99 -O2 -Wall` + G3-safe два слоя
   `-mcpu=G3 -Wl,-force_cpusubtype_ALL` (скилл ppc-build): скалярные части
   собираются под 750, подтип Mach-O = ppc/ALL
-- **AltiVec — runtime-режим, не цель сборки:** бинарь грузится на G3..G5;
-  VA-инструкции живут только за guard'ом `sysctl hw.optional.altivec`:
-  на G3 `-m vec` отказывает с понятным сообщением, `-m mixed` молча
-  деградирует до fp+int+mem (vec-блок опускается). На G4/G5 все режимы
-  работают как прежде.
+- **AltiVec удалён (решение 22.10.2026):** умолчательное состояние
+  сборки — БЕЗ AltiVec. Код-пути `vec`/`mixed`-VA, runtime-guard
+  `has_altivec()` и флаг `-faltivec` вырезаны; в бинаре VA-инструкций
+  НЕ ДОЛЖНО БЫТЬ (otool -tv = 0). Режимы: `fp` | `int` | `mem` |
+  `mixed` (mixed = fp + int + mem).
 
 ```sh
 ssh tiger
