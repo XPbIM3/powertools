@@ -12,11 +12,10 @@
   фольклором SuperPI (3.50 s / 1048576 на Core2-2.4). Ступени 128k/256k/
   512k/1M знаков, на каждую печатается время + чексумма цифр:
   побитовая сверка G3↔Core2 — чек-суммы и `-o`-файлы идентичны.
-- **MEM-фаза** — копия MEM-части `cpubench_naive` (LCG-заполн, прогрев,
-  copy, Sattolo-шаффл, полный dependent-load walk, чек-суммы). Буферы
-  `volatile` — под `-O2/-O1` компилятор не сворачивает copy в `memcpy`.
-  Собранный в `-O1`-мире, MEM **не эквивалентен** `-O0`-naive числам
-  (MB/s выше); pprint: 1517 MB/s на Core2 при naive 992.
+- **MEM-фаза** — наивный C-мир памяти: LCG-заполн, прогрев, честный copy,
+  Sattolo-шаффл (того же LCG), полный dependent-load walk, чек-суммы.
+  Буферы `volatile` — под `-O2/-O1` компилятор не сворачивает copy
+  в `memcpy`; pprint: 1517 MB/s на Core2 @2.4.
 
 ## Запуск
 
@@ -28,7 +27,7 @@ pimem -n                # proof: copy прибит к 32 пассам
 pimem -t S              # длина copy-фазы
 ```
 
-Машины с ≤192 МБ RAM — `-w 64`, как заведено в cpubench_naive.
+Машины с ≤192 МБ RAM — `-w 64`.
 
 ## Как собрано (записка 22.10.2026)
 
@@ -51,8 +50,7 @@ gcc -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL \
   отсутствует (`-malign-double` на ppc-gcc = error).
 - Два слоя G3-safe на месте: `otool -hv` = **PPC ALL**, `otool -tv` —
   VA-мнемоник **0**; без `-mmacosx-version-min=10.3` бинарь не грузится
-  на Panther (dyld: undefined `___stderrp` — ситуация известная по
-  naive-ppc).
+  на Panther (dyld: undefined `___stderrp`).
 - Канон сборки — **intel-leopard** (i386-gcc-4.0.1, build 5493) — кроссит
   ОБЕ цели штатно, проверено прогонами на обеих арках (решение пользователи
   22.10.2026: "собирать можно на интеле — он норм это делает").
@@ -64,8 +62,8 @@ gcc -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL \
 | otool подтип ppc | **PPC ALL** ✓ |
 | AltiVec-мнемоники | **0** ✓ |
 | знаки π, 4 ступени, G3↔Core2 | байт-в-байт (chk `f71873c3`, `cc217b24`, `ab84e40c`, `0fdf413c`; `-o`-файлы cmp = identical) ✓ |
-| MEM-чексумма `-w` по умолч. | `b27d388c` — совпал с naive-waterline ✓ |
-| MEM-чексумма `-w 64` | `b2e16b15` — совпал с naive-waterline ✓ |
+| MEM-чексумма `-w` по умолч. | `b27d388c` ✓ |
+| MEM-чексумма `-w 64` | `b2e16b15` ✓ |
 | `/tmp` walk | 95.6 ns/hop (Core2), 512.6 (G3-500@`-w 64`) — платные латентности ✓ |
 
 ## Артефакты
