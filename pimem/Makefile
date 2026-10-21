@@ -1,4 +1,7 @@
 # pimem.c - Ooura pi (SuperPI-class) tiers + MEM phase, one source, two targets
+# Уровень оптимизации ЗАФИКСИРОВАН: -O1 (свип всех уровней 22.10.2026:
+# O0 замедляет pi на Core 2 в 2.7x, на G3 в 1.8x; O1-O3-Os в пределах +-4%;
+# выбор -O1 = совпадение с фольклором SuperPI + честные числа на G3).
 CC      = gcc
 CFLAGS  = -std=gnu99 -O1 -Wall -fno-tree-vectorize \
           -funroll-loops -fomit-frame-pointer
