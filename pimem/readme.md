@@ -70,8 +70,8 @@ gcc -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL \
 
 ## Артефакты
 
-- `pimem-intel` md5 `1bb12a44a29984c6935a3396e3544cad`
-- `pimem-ppc`   md5 `6578a47cffe7aa57e204673b0f2f78d2`
+- `pimem-intel` md5 `9e75e78a84a33a0f1a206af48f6047ce`
+- `pimem-ppc`   md5 `477170e18ac62fcc1324f84e7ab3ee4e`
 
 Базовые цифры: `~/PowerTools/pimem_baseline.md` (лаконичная таблица,
 наполняется по мере обмеров машин).

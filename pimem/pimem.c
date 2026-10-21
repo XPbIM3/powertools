@@ -207,7 +207,8 @@ int main(int argc, char **argv)
     FILE *fout = NULL;
     int i;
 
-    static const int tiers[4] = { 131072, 262144, 524288, 1048576 };
+    static const int tiers[6] =
+        { 131072, 262144, 524288, 1048576, 2097152, 4194304 };
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc && atof(argv[i + 1]) > 0)
@@ -233,14 +234,14 @@ int main(int argc, char **argv)
 
     print_machine();
     if (n_fixed)
-        printf("pimem: pi 128k/256k/512k/1M + MEM proof (%d copy passes, "
+        printf("pimem: pi 128k/256k/512k/1M/2M/4M + MEM proof (%d copy passes, "
                "full walk, %lux2 MB)\n\n", MEM_N_PASSES,
                wbytes / (1024 * 1024));
     else
-        printf("pimem: pi 128k/256k/512k/1M + MEM copy %.0fs / walk, "
+        printf("pimem: pi 128k/256k/512k/1M/2M/4M + MEM copy %.0fs / walk, "
                "%lux2 MB\n\n", budget, wbytes / (1024 * 1024));
 
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < 6; i++)
         pi_tier(tiers[i], fout);
     if (fout)
         fclose(fout);
