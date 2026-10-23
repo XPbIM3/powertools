@@ -46,6 +46,9 @@ cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
   `has_altivec()` и флаг `-faltivec` вырезаны; в бинаре VA-инструкций
   НЕ ДОЛЖНО БЫТЬ (otool -tv = 0). Режимы: `fp` | `int` | `mem` |
   `mixed` (mixed = fp + int + mem).
+- Смок расширенного бинарника (23.10.2026, PowerMac G4 7400@400
+  Sawtooth, Tiger 10.4.11, md5 `7d9f570e…` байт-в-байт): mixed 3 с —
+  busy 100.0 %, чексумма выдана; `-m vec` = "unknown mode" отказ.
 
 ```sh
 ssh tiger
