@@ -34,19 +34,32 @@
 
 ## Использованная среда сборки
 
-- **ОС:** Mac OS X 10.5.8 (Leopard), Build 9L31a
-- **Архитектура:** PowerPC (Power Macintosh G5 тара, PowerMac7,3)
-- **Тулчейн:** GCC 4.0.1 (powerpc-apple-darwin9-gcc-4.0.1, Apple build 5493)
-- Сборка флагами: `-std=gnu99 -O2 -Wall -mcpu=G3 -Wl,-force_cpusubtype_ALL` — без warnings
-- Подтип бинарника: **PPC/ALL** (как у канонических Tiger-сборок), G3-совместимость
-  сохранена. Каноничное «младшее» правило (сборка на Tiger, gcc 4.0.1 darwin8)
-  сохраняется как цель — вернуться на Tiger-тулчейн при появлении iBook G4 в онлайне.
-  `force_cpusubtype_ALL` в Makefile вшита именно на случай сборки на Leopard-инструменте.
+- **Канон пересборки** (23.10.2026, тот же рецепт, что у pimem): кросс-сборка на
+  **intel-leopard** (`i686-apple-darwin9-gcc-4.0.1`, build 5493), ключи-флаги:
+
+```sh
+gcc -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL \
+    -mmacosx-version-min=10.3 -std=gnu99 -O2 -Wall diskbench.c -o diskbench
+```
+
+- `-arch ppc` — кросс-цель; `-mcpu=G3` — набор инструкций 750 (G3-safe слой 1);
+  `-Wl,-force_cpusubtype_ALL` — подтип Mach-O **PPC/ALL** (слой 2, одинаковый
+  бинарь на G3/G4/G5); `-mmacosx-version-min=10.3` — переносимость на
+  Panther/Tiger dyld (кросс с Leopard без minos тянет символы/libc,
+  которых нет на старых системах — ловили на pimem: `___stderrp`).
+- Аудит после сборки: `otool -hv` → PPC ALL; `otool -tv | grep -icE 'v(a|m)[a-z]+'` → **0**.
+  Артефакт: md5 `5befe44abda4e420a34cb189be5c37a9`.
+- Верификация запуском: PowerMac3,1 (Sawtooth G4-7400 @400, Tiger 10.4.11,
+  онбординг 23.10.2026) — полный дефолтный прогон прошёл, цифры ниже.
+- Родная PPC-сборка (`make` на любой PPC-машине парка) остаётся валидной;
+  Makefile держит оба слоя `G3-safe` по умолчанию.
 
 ## Как собрать ещё раз
 
 ```sh
-ssh powermac-g5
+# кросс (канон): слить исходник на intel-leopard и собрать флагами выше
+# либо нативно на любой PPC-машине парка:
+ssh <ppc-машина>
 cd ~/Projects/diskbench
 make clean && make
 ```
@@ -58,6 +71,15 @@ linear write       6.236 s      20.5 MB/s
 linear read        5.965 s      21.5 MB/s
 random write      62.492 s       1.0 MB/s        262 ops/s  avg  3814.2 us/op
 random read      111.934 s       0.6 MB/s        146 ops/s  avg  6831.9 us/op
+```
+
+## Пример результата (PowerMac3,1 Sawtooth G4-7400@400, IDE-диск, nocache, 23.10.2026)
+
+```
+linear write      16.846 s      30.4 MB/s
+linear read       26.115 s      19.6 MB/s
+random write      31.639 s       0.5 MB/s         129 ops/s  avg  7724.4 us/op
+random read       36.362 s       0.4 MB/s         113 ops/s  avg  8877.5 us/op
 ```
 
 (C: linear ~20–43 MB/s в зависимости от режима; random 4K ~150–500 IOPS)
