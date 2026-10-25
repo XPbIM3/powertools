@@ -107,3 +107,22 @@ random read       35.985 s       0.4 MB/s         114 ops/s  avg  8785.5 us/op
 ```
 
 (C: linear ~20–43 MB/s в зависимости от режима; random 4K ~150–500 IOPS)
+
+## Пример результата (PowerMac3,5 Quicksilver, RAID-0 из 2×ST360021A на одном канале ATA/66, оба 7200 rpm, nocache, 26.10.2026)
+
+```
+linear write      20.816 s      24.6 MB/s
+linear read       35.235 s      14.5 MB/s
+random write      10.100 s       1.6 MB/s         406 ops/s  avg  2465.9 us/op
+random read       21.821 s       0.7 MB/s         188 ops/s  avg  5327.5 us/op
+```
+
+Apple software RAID v2 Stripe (`diskutil listRAID`: Online, 2 члена), том
+`/dev/disk2` 111.5 GiB HFS+ journaled — корневой, свободно 104 GiB. Ключевое:
+**оба диска сидят на одном канале `uataat66` (Ultra ATA/66) — master+slave**,
+поэтому страйп упирается в общий потолок шины (~60–66 МБ/с) и не даёт
+удвоения; random 4K страйп не ускоряет вовсе (4K всегда в один член).
+Контроль кеша (`-c`, тот же чанк): read 59.8 МБ/с — почти предел ATA/66,
+т.е. nocache-цифры честные. Полный разбор и второй пасс:
+`notes-quicksilver-raid0.md`.
+
