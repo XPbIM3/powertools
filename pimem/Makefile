@@ -5,8 +5,11 @@
 CC      = gcc
 CFLAGS  = -std=gnu99 -O1 -Wall -fno-tree-vectorize \
           -funroll-loops -fomit-frame-pointer
-# G3-safe PPC: оба слоя (скилл ppc-build) + minos 10.3 (Panther dyld)
-PPC_FLAGS = -mcpu=G3 -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.3
+# G3-safe PPC: три слоя (скилл ppc-build) + -arch ppc кросс-цель.
+# Фикс 25.10.2026: без -arch ppc на intel-хосте -mcpu=G3 не проходил
+# (cc1: invalid option 'cpu=G3') - make падал, хотя readme канонил кросс
+# именно оттуда. На PPC-хосте -arch ppc = родная цель, флаги безвредны.
+PPC_FLAGS = -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.3
 # x86-only: без него PPC-ветка не собирается
 INT_FLAGS = -malign-double
 

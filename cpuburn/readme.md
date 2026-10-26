@@ -35,12 +35,16 @@ cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
 
 ## Сборка
 
-- **ОС:** Mac OS X 10.4.11 (Tiger), iMac G5 PowerPC
-- **Тулчейн:** канон парка — ibook-g4-1ghz, Tiger 10.4 (gcc 4.0.1 darwin8
-  build 5370); сборка 0 warnings
-- Флаги: `-std=gnu99 -O2 -Wall` + G3-safe два слоя
-  `-mcpu=G3 -Wl,-force_cpusubtype_ALL` (скилл ppc-build): скалярные части
-  собираются под 750, подтип Mach-O = ppc/ALL
+- **Канон пересборки** (решение 22.10.2026, как у pimem/diskbench): кросс-сборка
+  на **intel-leopard** (`i686-apple-darwin9-gcc-4.0.1`, build 5493, Leopard 10.5
+  + Xcode) — кроссит PPC-цель штатно. Нативная сборка на PPC-машине парка
+  остаётся валидной (те же флаги из Makefile).
+- Три слоя G3-safe в Makefile (флаги одинаковы на обоих хостах):
+  `-arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.3`.
+  Без minos 10.3 кросс с Leopard влечёт за собой символы libSystem,
+  отсутствующие на Panther (`___stderrp`). Аудит после сборки:
+  `otool -hv` → **PPC ALL**; `otool -tv | grep -icE 'v(a|m)[a-z]+'` → **0**
+  (отсутствие VA — решение 22.10.2026, ниже).
 - **AltiVec удалён (решение 22.10.2026):** умолчательное состояние
   сборки — БЕЗ AltiVec. Код-пути `vec`/`mixed`-VA, runtime-guard
   `has_altivec()` и флаг `-faltivec` вырезаны; в бинаре VA-инструкций
@@ -51,9 +55,11 @@ cpuburn [-n THREADS] [-t SECONDS] [-m MODE] [-h]
   busy 100.0 %, чексумма выдана; `-m vec` = "unknown mode" отказ.
 
 ```sh
-ssh tiger
+# канон: кросс на intel-leopard (флаги уже в Makefile)
+ssh intel-leopard
 cd ~/Projects/burn
-make clean && make
+make clean && make        # затем аудит otool и слияние артефакта в гит (§3 скилла ppc-build)
+# нативно (валидно): ssh <ppc-машина> — те же флаги из Makefile
 ```
 
 ## Запуск

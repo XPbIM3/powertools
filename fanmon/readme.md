@@ -46,12 +46,20 @@ Watch-режим рисуется без моргания: кадр сначал
 
 ## Сборка
 
-- **ОС:** Mac OS X 10.4.11 (Tiger), iMac G5 PowerPC
-- **Тулчейн:** Xcode 2.5 → GCC 4.0.1 (powerpc-apple-darwin8)
-- Флаги г. `-std=gnu99 -O2 -Wall`, линкер с `-framework CoreFoundation -framework IOKit`
+- **Канон пересборки** (решение 22.10.2026, как у pimem/diskbench): кросс-сборка
+  на **intel-leopard** (`i686-apple-darwin9-gcc-4.0.1`, build 5493); нативная
+  сборка на PPC-машине парка остаётся валидной.
+- Три слоя G3-safe в Makefile (флаги одинаковы на обоих хостах):
+  `-arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.3` +
+  `CFLAGS -std=gnu99 -O2 -Wall`, линкер с
+  `-framework CoreFoundation -framework IOKit` (публичные, древние — кросс не
+  ломает). Аудит после сборки: `otool -hv` → **PPC ALL**;
+  `otool -tv | grep -icE 'v(a|m)[a-z]+'` → **0**.
 
 ```sh
-ssh tiger
+# канон: кросс на intel-leopard (флаги уже в Makefile)
+ssh intel-leopard
 cd ~/Projects/fanmon
-make clean && make
+make clean && make        # затем аудит otool и слияние артефакта в гит (§3 скилла ppc-build)
+# нативно (валидно): ssh <ppc-машина> — те же флаги из Makefile
 ```
