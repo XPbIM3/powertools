@@ -276,6 +276,88 @@ static void take_identity(io_object_t obj, disk_t *d)
 
 /* ------------------------------------------------------------- SMART */
 
+static int os_major(void)
+{
+    int    mib[2];
+    char   buf[64];
+    size_t len = sizeof buf;
+
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_OSRELEASE;
+    if (sysctl(mib, 2, buf, &len, NULL, 0) != 0)
+        return -1;
+    return atoi(buf);
+}
+
+/* ATA IDENTIFY strings: each 16-bit word holds two chars, high byte first.
+   Apple returns the words in native order, so read the word natively and
+   split it - that is correct on both G3/G4/G5 and i386. */
+static void ata_id_str(const unsigned char *buf, int first, int last,
+                       char *out, size_t outsz)
+{
+    size_t n = 0;
+    int    i;
+
+    out[0] = '\0';
+    for (i = first; i <= last && n + 1 < outsz; i++) {
+        uint16_t w;
+        char     c1, c2;
+
+        memcpy(&w, buf + i * 2, 2);
+        c1 = (char)(w >> 8);
+        c2 = (char)(w & 0xff);
+        if (c1 == 0)
+            break;
+        out[n++] = c1;
+        if (c2 == 0 || n + 1 >= outsz)
+            break;
+        out[n++] = c2;
+    }
+    out[n] = '\0';
+    trim(out);
+}
+
+/* GetATAIdentifyData is the last vtable entry and does not exist on 10.2,
+   so it is called only on Darwin 7+ (Panther 10.3 and later) and only to
+   fill fields the registry did not provide (e.g. PATA on Tiger publishes
+   Product Name/FW but no Serial Number). */
+static int retryable(IOReturn kr);
+
+static void identify_fill(IOATASMARTInterface **ifp, disk_t *d)
+{
+    unsigned char buf[512];
+    UInt32        out = 0;
+    char          tmp[48];
+    IOReturn      kr;
+    int           i;
+
+    memset(buf, 0, sizeof buf);
+    for (i = 0; i < 4; i++) {
+        kr = (*ifp)->GetATAIdentifyData(ifp, buf, sizeof buf, &out);
+        if (!retryable(kr))
+            break;
+        usleep(500000);
+    }
+    if (kr != kIOReturnSuccess)
+        return;
+
+    if (!d->model[0]) {
+        ata_id_str(buf, 27, 46, tmp, sizeof tmp);
+        if (tmp[0])
+            snprintf(d->model, sizeof d->model, "%s", tmp);
+    }
+    if (!d->serial[0]) {
+        ata_id_str(buf, 10, 19, tmp, sizeof tmp);
+        if (tmp[0])
+            snprintf(d->serial, sizeof d->serial, "%s", tmp);
+    }
+    if (!d->fw[0]) {
+        ata_id_str(buf, 23, 26, tmp, sizeof tmp);
+        if (tmp[0])
+            snprintf(d->fw, sizeof d->fw, "%s", tmp);
+    }
+}
+
 static int csum_ok(const void *buf, size_t len)
 {
     const unsigned char *p = (const unsigned char *)buf;
@@ -287,16 +369,24 @@ static int csum_ok(const void *buf, size_t len)
     return (sum & 0xff) == 0;
 }
 
+/* A spun-down drive answers NotReady/Timeout for a second or two; retry
+   long enough to let it come up (worst case 6 x 500 ms). */
+static int retryable(IOReturn kr)
+{
+    return kr == kIOReturnTimeout || kr == kIOReturnNotResponding ||
+           kr == kIOReturnNotReady;
+}
+
 static IOReturn read_status(IOATASMARTInterface **ifp, Boolean *exceeded)
 {
     IOReturn kr = kIOReturnError;
     int      i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 6; i++) {
         kr = (*ifp)->SMARTReturnStatus(ifp, exceeded);
-        if (kr != kIOReturnTimeout && kr != kIOReturnNotResponding)
+        if (!retryable(kr))
             break;
-        usleep(200000);
+        usleep(500000);
     }
     return kr;
 }
@@ -306,11 +396,11 @@ static IOReturn read_data(IOATASMARTInterface **ifp, ATASMARTData *sd)
     IOReturn kr = kIOReturnError;
     int      i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 6; i++) {
         kr = (*ifp)->SMARTReadData(ifp, sd);
-        if (kr != kIOReturnTimeout && kr != kIOReturnNotResponding)
+        if (!retryable(kr))
             break;
-        usleep(200000);
+        usleep(500000);
     }
     return kr;
 }
@@ -320,11 +410,11 @@ static IOReturn read_thr(IOATASMARTInterface **ifp, ATASMARTDataThresholds *th)
     IOReturn kr = kIOReturnError;
     int      i;
 
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 6; i++) {
         kr = (*ifp)->SMARTReadDataThresholds(ifp, th);
-        if (kr != kIOReturnTimeout && kr != kIOReturnNotResponding)
+        if (!retryable(kr))
             break;
-        usleep(200000);
+        usleep(500000);
     }
     return kr;
 }
@@ -488,6 +578,7 @@ static void err_note(IOReturn kr, char *out, size_t outsz)
     case kIOReturnTimeout:         s = "no response (spun down?)";        break;
     case kIOReturnNotResponding:   s = "no response (spun down?)";        break;
     case kIOReturnBadArgument:     s = "bad argument";                    break;
+    case kIOReturnNotReady:        s = "not ready (spinning up?)";         break;
     case kIOReturnNoResources:     s = "cannot load SMART plugin "
                                        "(arch mismatch?)";                break;
     default:                       s = NULL;                              break;
@@ -646,6 +737,8 @@ static void probe(const char *name, disk_t *d)
             IODestroyPlugInInterface(plugin);
             return;
         }
+        if (os_major() >= 7)        /* 10.3+: GetATAIdentifyData exists */
+            identify_fill(ifp, d);
         read_all(ifp, d);
         (*ifp)->Release(ifp);
         IODestroyPlugInInterface(plugin);

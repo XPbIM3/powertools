@@ -19,9 +19,10 @@
 в коде этих вызовов просто нет.
 
 Модель/серийник/прошивка/интерфейс берутся из IORegistry
-(`Device Characteristics`, `Protocol Characteristics`), а не из ATA
-IDENTIFY: так они доступны и на 10.2, где `GetATAIdentifyData` ещё нет.
-IDENTIFY утилита не вызывает вообще — ABI-риска на Jaguar нет.
+(`Device Characteristics`, `Protocol Characteristics`). На 10.3+ недостающие
+поля (на PATA-Tiger в реестре нет `Serial Number`) добираются через
+`GetATAIdentifyData` — под гейтом `kern.osrelease >= 7`, потому что в 10.2
+этого метода в vtable ещё нет.
 
 ## Детект дисков
 
@@ -52,12 +53,13 @@ RAID-тома попадают в таблицу строкой с причин�
 | ОС | SMART API | `SMART Capable` | IDENTIFY | примечание |
 |---|---|---|---|---|
 | 10.2 Jaguar | есть (10 методов) | нет | нет | детект по `ATA Features & 0x20` |
-| 10.3 Panther | то же + | нет | `GetATAIdentifyData` | детект по `ATA Features` |
-| 10.4 Tiger | то же | **есть** | есть | — |
+| 10.3 Panther | то же + `GetATAIdentifyData` | нет | есть | детект по `ATA Features` |
+| 10.4 Tiger | то же | **есть** | есть | PATA: в реестре нет серийника |
 | 10.5 Leopard | то же | есть | есть | + AHCI и SATL |
 
-`GetATAIdentifyData` — последний элемент vtable, добавлен в 10.3; утилита
-его не вызывает, поэтому на 10.2 структура не читается за границей.
+`GetATAIdentifyData` — последний элемент vtable, добавлен в 10.3; вызывается
+только при `kern.osrelease >= 7` и только чтобы заполнить пустые поля, так
+что структура на 10.2 не читается за границей.
 
 ## Вывод
 
@@ -138,21 +140,32 @@ ppc-флаги (канон `ppc-build`): `-arch ppc -mcpu=G3
 
 ## Обкатка
 
-Проверено живьём на **MacBookPro3,1, 10.5.8 i386** (AHCI,
-`AHCISMARTUserClient`): диск определяется, атрибуты и пороги читаются,
-вердикт OK, `-d`/`-a`/`-h` и коды возврата работают.
+Проверено живьём:
 
-Отдельно проверено: ppc-бинарь на Intel-хосте под Rosetta **не работает** —
-`IOCreatePlugInInterfaceForService` возвращает `kIOReturnNoResources`
-(ppc-процесс не может загрузить i386-плагин SMARTLib). Это ожидаемо, на
-Intel-машинах нужен `smartinfo-i386`; сообщение об ошибке это и говорит.
+- **MacBookPro3,1, 10.5.8 i386** (AHCI, `AHCISMARTUserClient`): FUJITSU
+  MHV2080BH, OK, атрибуты и пороги читаются, `-d`/`-a`/`-h` и коды
+  возврата работают.
+- **PowerMac3,5 QuickSilver, 10.4.11 PPC** (PATA, `ATASMARTUserClient`):
+  два ST360021A, оба WARN по `199 UDMA_CRC` (11 и 898), поверхность чистая
+  (`5/197/198` = 0). Подробности — `notes-quicksilver.md`.
 
-Ещё не проверено (нужны PPC-машины парка):
+Побочные результаты живой обкатки:
+
+- на 10.4 PATA в `Device Characteristics` нет серийника — добавлен добор
+  через IDENTIFY (10.3+);
+- спящий диск отвечает `kIOReturnNotReady`; ретраи увеличены до 6×500 мс,
+  иначе живая машина показывала `no response (spun down?)`;
+- ppc-бинарь на Intel-хосте под Rosetta не работает:
+  `IOCreatePlugInInterfaceForService` возвращает `kIOReturnNoResources`
+  (ppc-процесс не может загрузить i386-плагин SMARTLib). Это ожидаемо, для
+  Intel-машин нужен `smartinfo-i386`; сообщение об ошибке это и говорит.
+
+Ещё не проверено (нужны машины парка):
 
 - 10.2 Jaguar — путь детекта без `SMART Capable` (`ATA Features` на узле
   или в `Device Characteristics`), отсутствие падения на vtable;
-- 10.3 Panther — то же плюс `ATA Features` = 0x27 в фикстурах;
-- G5 K2 SATA (`AppleSATLSMARTUserClient`) и PATA (`ATASMARTUserClient`);
-- поведение на спящем диске и на CD в приводе.
+- 10.3 Panther — то же, `ATA Features` = 0x27 в фикстурах;
+- G5 K2 SATA (`AppleSATLSMARTUserClient`);
+- CD в приводе и USB-флешка (должны попасть в `n/a` с причиной).
 
 Результаты живых прогонов писать в `notes-<модель>.md` этого каталога.
