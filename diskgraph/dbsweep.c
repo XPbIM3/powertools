@@ -200,6 +200,7 @@ static void csv_line(const char *kind, uint64_t off, uint64_t bytes,
                 off, bytes, us);
     else
         fprintf(g_csv, "E,%" PRIu64 ",%ld\n", off, err);
+    fflush(g_csv);   /* UI tail'ит файл - строки живые */
 }
 
 static void stdout_line(const char *kind, uint64_t off, uint64_t bytes,
