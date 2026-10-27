@@ -108,8 +108,31 @@ md5 ...; scp -O ... tar ...; md5 same
 Флаги - канон репо (см. Makefile), фреймворки Foundation/AppKit/
 Security/IOKit. бинарь ppc/ALL мин-10.2 - Jaguar..Леопард.
 
+## authprobe - верификатор Authorization-вызова
+
+`authprobe.c` - малый CLI-пробник той же механики, что в DiskGraph:
+AuthorizationCreate + ExecuteWithPrivileges(/bin/sh -c 'echo ok >
+/tmp/authprobe.out'), печатает каждый OSStatus поимённо и факт работы
+root-тула. Живёт в репо для будущих клеток/Tiger-машин:
+
+```
+rsync -a authprobe.c intel-leopard:/tmp/ && ssh intel-leopard \
+'gcc -std=gnu99 -O2 -Wall -arch ppc -mcpu=G3 \
+ -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.2 \
+ -framework Security -o /tmp/authprobe2 /tmp/authprobe.c' && \
+scp -O intel-leopard:/tmp/authprobe2 МАШИНА:/tmp/
+# на МАШИНЕ в Terminal: /tmp/authprobe2  (ввести пароль в диалог)
+```
+
 ## Грабли-копилка
 
+- **AuthorizationExecuteWithPrivileges на Tiger: options MUST be zero.**
+  Заголовок 10.4u SDK прямо: "Option bits (reserved). Must be zero."
+  Наш первый вызов с bundled InteractionAllowed|ExtendRights дал
+  -60011 = errAuthorizationInvalidFlags (не диалог, а честный отказ).
+  Правка: kAuthorizationFlagDefaults - диалог SecurityAgent рисуется
+  сам, флагов не надо (подтверждено authprobe-пробником на живой
+  машине: root-тул отработал).
 - duty-шаг не кратный 512 → EINVAL на rdisk (ловили, 620 E за
   2G-прогон) - сделали квантование по сектору
 - спин-ап даёт первую точку на 500+ мс - двойной warm-up для

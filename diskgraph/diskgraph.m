@@ -425,10 +425,11 @@ static OSStatus run_privileged(const char *tool, char *const args[],
                              &auth);
     if (rc != errAuthorizationSuccess)
         return rc;
+    /* Tiger header: ExecuteWithPrivileges options "reserved, MUST be
+     * zero" - любые биты дают -60011 invalid flags (ловили).
+     * Password-диалог SecurityAgent оно показывает само. */
     rc = AuthorizationExecuteWithPrivileges(auth, tool,
-        kAuthorizationFlagDefaults |
-        kAuthorizationFlagInteractionAllowed |
-        kAuthorizationFlagExtendRights,
+        kAuthorizationFlagDefaults,
         args, outp);
     AuthorizationFree(auth, kAuthorizationFlagDefaults);
     return rc;
