@@ -8,6 +8,8 @@ CFLAGS  = -std=gnu99 -O2 -Wall
 # 4) -mmacosx-version-min=10.2 - одна libSystem, Jaguar..Leopard.
 TARGET_FLAGS = -arch ppc -mcpu=G3 -Wl,-force_cpusubtype_ALL -mmacosx-version-min=10.2
 TARGET      = dbsweep
+LIN         = dblin
+RND         = dbrnd
 PROBE       = graphprobe
 APP         = GraphProbe.app
 APP2        = DiskGraph.app
@@ -16,10 +18,18 @@ APPFLAGS    = $(CFLAGS) $(TARGET_FLAGS) -fobjc-abi-version=1 \
               -framework Foundation -framework AppKit -framework Security \
               -framework IOKit
 
-all: $(TARGET) $(APP) $(APP2)
+all: $(TARGET) $(LIN) $(RND) $(APP) $(APP2)
 
 $(TARGET): dbsweep.c
 	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(TARGET) dbsweep.c
+
+# консольные тулзы (фаза UI на паузе): линейный пунктир и random
+# по времени; человекочитаемый stdout, ноль CSV
+$(LIN): dblin.c
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(LIN) dblin.c
+
+$(RND): dbrnd.c
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(RND) dbrnd.c
 
 # ступень 2: пробник рисования (окно NSView + drawRect) - objc1
 # конструкции, кросс с Leopard на все клетки 10.2..10.5
@@ -38,5 +48,5 @@ $(APP2): diskgraph.m Info-diskgraph.plist $(TARGET)
 	@cp $(TARGET) $(APP2)/Contents/Resources/
 
 clean:
-	rm -f $(TARGET) $(PROBE) diskgraph
+	rm -f $(TARGET) $(LIN) $(RND) $(PROBE) diskgraph
 	rm -rf $(APP) $(APP2)

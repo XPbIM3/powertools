@@ -21,6 +21,25 @@
 - raw-ноды root:operator 640 - движок запускается под root через
   AuthorizationExecuteWithPrivileges (пароль-диалог с 10.2)
 
+# dblin / dbrnd - консольные тулзы (UI на паузе)
+
+Два независимых бинаря поверх той же логики, человекочитаемый stdout
+(единственный выходной канал, CSV для них не нужен):
+
+```
+sudo dblin -d /dev/rdiskN [-c 32M] [-b 1M] [-D 10] [-m 0]
+sudo dbrnd -d /dev/rdiskN [-B 4K]  [-T 10] [-w 16] [-s seed]
+```
+
+- dblin: пунктирный проход, чанки эквидистантно от LBA0, шаг =
+  chunk*(100-duty)/duty; строка на каждый блок `L ..GB ..M ..ms ..MB/s`
+- dbrnd: -T-секундный random; строка на каждый оп `R ..GB ..ms`
+- сводка в конце `--- points/ops ... med ... p99 ... eio N time m:ss`
+- честность-набор как у dbsweep (raw-нода обязательна, /dev/diskN -
+  warning); duty-дефолт 10%, random-дефолт 10 с (не боевые, для отладки)
+- dbsweep остаётся валидированным композитом (обе фазы + CSV),
+  UI DiskGraph - на паузе, не дропнут
+
 ## dbsweep - движок
 
 ```
