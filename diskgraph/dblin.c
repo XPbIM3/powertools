@@ -173,7 +173,7 @@ int main(int argc, char **argv)
                    "multiple of -b\n"
                    "  -b SIZE   read block            default 1M, "
                    "power of two\n"
-                   "  -D N      duty percent 10..100  default 10 "
+                   "  -D N      duty percent 1..100   default 10 "
                    "(100 = solid)\n"
                    "  -m SIZE   sweep limit           default 0 = "
                    "whole capacity\n"
@@ -194,8 +194,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "dblin: chunk must be a multiple of the block\n");
         return 1;
     }
-    if (duty < 10 || duty > 100) {
-        fprintf(stderr, "dblin: duty percent must be 10..100\n");
+    if (duty < 1 || duty > 100) {
+        fprintf(stderr, "dblin: duty percent must be 1..100\n");
         return 1;
     }
     if (is_pow2(blk) == 0)

@@ -1,16 +1,22 @@
 /*
- * diskgraph.m - UI DiskGraph: две вкладки (Linear / Random) на РЕАЛЬНЫХ
- *               замерах через dglincore/dgrndcore
+ * diskgraph.m - UI DiskGraph: три вкладки (Linear read / Random access /
+ *               Random seek) на РЕАЛЬНЫХ замерах через dglincore/dgrndcore
  *
  * Фронт и бэк скрещены: вкладки зовут те же ядра, что и консольные
  * dblin/dbrnd, но данные приходят не в stdout, а в sink-калбеки:
- *   - linear: sink сегмента -> точка (offset, MB/s) на графике;
- *   - random: sink опа     -> точка (offset, лаг µs) на scatter.
+ *   - Linear read   : сегмент -> точка (позиция, MB/s), кривая;
+ *   - Random access : оп -> точка (дистанция от прошлого чтения, лаг),
+ *                     позиции равномерно по диску (время доступа);
+ *   - Random seek   : хоп -> точка (дистанция хопа, лаг) на лог-оси X,
+ *                     дистанции log-равномерно 8K..ёмкость (профиль
+ *                     перемещения головки).
+ * Обе random-вкладки - один код (rndtab), разный режим ядра.
  *
  * Поток: UI-поток (AppKit) + один рабочий поток на запуск (pthread).
  * Рабочий поток только дописывает точки в массивы под мьютексом и
  * никогда не трогает ObjC. UI раз в 0.25 c снимает копию данных под
  * мьютексом и рисует уже без него - замер не ждёт отрисовку.
+ * Одновременно идёт один прогон.
  *
  * Вкладки независимы: у каждой свой диск, своя ёмкость оси X и свои
  * данные; переключение вкладок данные не трогает.
@@ -22,7 +28,7 @@
  * Только ЧТЕНИЕ. Запись не выполняется никогда.
  *
  * ObjC строго objc1 (Jaguar..Leopard runtime): без свойств и fast
- * enumeration; @"..."-литералы только ASCII.
+ * enumeration; @"..."-литералы только ASCII; только API 10.2.
  */
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
@@ -51,12 +57,18 @@
 #define WIN_H  720.0f
 
 #define GIB 1073741824.0
+#define SEEK_XMIN 4096.0           /* левый край лог-оси хопов */
+#define NBIN 24                    /* корзин по дистанции       */
+
+/* g_run: какой прогон идёт */
+enum { RUN_IDLE = 0, RUN_LIN = 1, RUN_ACC = 2, RUN_SEEK = 3 };
 
 /* ------------------------------------------------------------ данные */
 
 typedef struct {
-    double off;   /* позиция по ёмкости, байты */
-    double val;   /* MB/s (linear) / µs (random) */
+    double x;     /* linear: позиция; random: дистанция, байты */
+    double val;   /* MB/s (linear) / µs (random)               */
+    int    tag;   /* random: +1 вперёд, -1 назад                */
 } dpt;
 
 /* растущий массив точек: ёмкость удваивается, без realloc на точку */
@@ -66,72 +78,80 @@ typedef struct {
     int  alloc;
 } dbuf;
 
-static dbuf g_lin = { NULL, 0, 0 };
-static dbuf g_rnd = { NULL, 0, 0 };
-
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---- состояние прогонов (под g_lock, кроме помеченного) ---- */
-static int  g_run = 0;                  /* UI-поток: 0 idle, 1 lin, 2 rnd */
+static int g_run = RUN_IDLE;            /* UI-поток */
+static time_t g_run_t0 = 0;             /* UI-поток */
+
+/* ---- Linear read (под g_lock, кроме помеченного) ---- */
+static dbuf g_lin = { NULL, 0, 0 };
 static volatile int g_lin_cancel = 0;
-static volatile int g_rnd_cancel = 0;
-static int  g_lin_done = 0, g_rnd_done = 0;
-static int  g_lin_failed = 0, g_rnd_failed = 0;
-static int  g_lin_oserr = 0, g_rnd_oserr = 0;
+static int  g_lin_done = 0;
+static int  g_lin_failed = 0;
+static int  g_lin_oserr = 0;
 static char g_lin_err[256] = "";
-static char g_rnd_err[256] = "";
 static dglinresult g_lin_res;
-static dgrndresult g_rnd_res;
 static uint64_t g_lin_total = 0;        /* сегментов в плане */
 static uint64_t g_lin_bytes = 0;        /* суммы для живого avg */
 static uint64_t g_lin_time_us = 0;
 static int      g_lin_idx_done = 0;     /* сегментов завершено */
 static int      g_lin_elapsed = 0;      /* длительность прогона, с */
-static int      g_rnd_elapsed = 0;
-static time_t   g_run_t0 = 0;           /* UI-поток */
+static double   g_lin_datacap = 0.0;    /* ёмкость прочитанного диска */
 
-/* ёмкость устройства, которое реально читали (ось X при данных) */
-static double g_lin_datacap = 0.0;
-static double g_rnd_datacap = 0.0;
-
-/* UI-поток: выбор в popup вкладки и его ёмкость (ось X без данных) */
+/* UI-поток */
 static char   g_lin_sel[64] = "/dev/rdisk0";
-static char   g_rnd_sel[64] = "/dev/rdisk0";
 static double g_lin_selcap = 0.0;
-static double g_rnd_selcap = 0.0;
+static char   g_lin_path[64] = "";      /* снимок на Старт */
+static int    g_lin_duty = 5;
+static int    g_duty = 5;
 
-/* снимок параметров на момент Старт (читает рабочий поток) */
-static char g_lin_path[64] = "";
-static int  g_lin_duty = 10;
-static char g_rnd_path[64] = "";
-static int  g_rnd_secs_run = 30;
+/* ---- Random access / Random seek: одна структура на вкладку ---- */
+typedef struct {
+    int          mode;          /* DGRND_ACCESS / DGRND_SEEK          */
+    int          run_id;        /* RUN_ACC / RUN_SEEK                 */
+    const char  *name;          /* "Random access"                    */
 
-/* UI-поток: значения слайдеров */
-static int g_duty = 10;
-static int g_rnd_secs = 30;
+    /* под g_lock */
+    dbuf         pts;
+    volatile int cancel;
+    int          done, failed, oserr, elapsed;
+    char         err[256];
+    dgrndresult  res;
+    double       datacap;
 
-/* UI-поток: med/p99 random, пересчёт раз в тик */
-static double g_rnd_med = 0.0, g_rnd_p99 = 0.0;
-static int    g_rnd_stat_n = -1;
+    /* UI-поток */
+    char         sel[64];
+    double       selcap;
+    char         path[64];      /* снимок на Старт                    */
+    int          secs, secs_run;
+    int          stat_n;        /* по скольким точкам посчитано       */
+    double       med, p99;
+    double       short_med, long_med;   /* seek: <1 MB и > 1/2 диска */
+    int          bn[NBIN];
+    double       bmed[NBIN], blo[NBIN];
+
+    NSPopUpButton *dev;
+    NSSlider      *slider;
+    NSTextField   *val;
+    NSTextField   *status;
+    NSButton      *start, *stop;
+    NSView        *view;
+} rndtab;
+
+static rndtab g_acc;
+static rndtab g_seek;
 
 /* 1 - процесс с правами root (иначе чтение rdisk упрётся в EACCES) */
 static int g_is_root = 0;
 
-/* ---- UI ---- */
+/* ---- UI Linear ---- */
 static NSTextField   *g_lin_status = NULL;
-static NSTextField   *g_rnd_status = NULL;
 static NSTextField   *g_duty_val  = NULL;
-static NSTextField   *g_secs_val  = NULL;
 static NSButton      *g_lin_start = NULL;
-static NSButton      *g_rnd_start = NULL;
 static NSButton      *g_lin_stop  = NULL;
-static NSButton      *g_rnd_stop  = NULL;
 static NSSlider      *g_lin_slider = NULL;
-static NSSlider      *g_rnd_slider = NULL;
 static NSView        *g_lin_view = NULL;
-static NSView        *g_rnd_view = NULL;
 static NSPopUpButton *g_lin_dev = NULL;
-static NSPopUpButton *g_rnd_dev = NULL;
 static NSTabView     *g_tabs = NULL;
 
 /* dev-хук -cycle */
@@ -148,8 +168,27 @@ static int g_again = 0;
 static time_t    g_close_at = 0;
 static NSWindow *g_win = NULL;
 
+static void rndtab_init(rndtab *t, int mode, int run_id, const char *name,
+                        int secs)
+{
+    memset(t, 0, sizeof *t);
+    t->mode   = mode;
+    t->run_id = run_id;
+    t->name   = name;
+    t->secs   = secs;
+    t->stat_n = -1;
+    strcpy(t->sel, "/dev/rdisk0");
+}
+
+static rndtab *rndtab_of_run(int run)
+{
+    if (run == RUN_ACC)  return &g_acc;
+    if (run == RUN_SEEK) return &g_seek;
+    return NULL;
+}
+
 /* вызывать под g_lock */
-static int pts_add(dbuf *b, double off, double val)
+static int pts_add(dbuf *b, double x, double val, int tag)
 {
     if (b->n == b->alloc) {
         int  na = (b->alloc > 0) ? b->alloc * 2 : 1024;
@@ -159,16 +198,11 @@ static int pts_add(dbuf *b, double off, double val)
         b->a = p;
         b->alloc = na;
     }
-    b->a[b->n].off = off;
+    b->a[b->n].x   = x;
     b->a[b->n].val = val;
+    b->a[b->n].tag = tag;
     b->n++;
     return 1;
-}
-
-/* вызывать под g_lock; память не отдаём - следующий прогон её займёт */
-static void pts_clear(dbuf *b)
-{
-    b->n = 0;
 }
 
 /* вызывать под g_lock: копия src в dst (для рисования без лока) */
@@ -193,36 +227,134 @@ static double mbs_of(uint64_t bytes, uint64_t us)
     return us > 0 ? (double)bytes / ((double)us / 1e6) / 1048576.0 : 0.0;
 }
 
-/* UI-поток: med/p99 random по снимку, сортировка вне лока */
-static void rnd_stats_update(void)
+/* ------------------------------------------------------- оси X */
+
+/* доля 0..1 по оси X: random seek - лог-ось от SEEK_XMIN, иначе линейная */
+static double x_frac(int xlog, double x, double cap)
 {
-    static double *v = NULL;
+    double f;
+
+    if (cap <= 0.0)
+        return 0.0;
+    if (xlog) {
+        if (cap <= SEEK_XMIN)
+            return 0.0;
+        if (x < SEEK_XMIN)
+            x = SEEK_XMIN;
+        f = log(x / SEEK_XMIN) / log(cap / SEEK_XMIN);
+    } else {
+        f = x / cap;
+    }
+    if (f < 0.0) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    return f;
+}
+
+static int bin_of(int xlog, double x, double cap)
+{
+    int b = (int)(x_frac(xlog, x, cap) * (double)NBIN);
+    return (b >= NBIN) ? NBIN - 1 : b;
+}
+
+static double rnd_cap(const rndtab *t, int npts)
+{
+    /* ось по прочитанному диску, если данные есть или идёт прогон */
+    if ((npts > 0 || g_run == t->run_id) && t->datacap > 0.0)
+        return t->datacap;
+    return t->selcap;
+}
+
+/* ------------------------------------------------------- статистика */
+
+typedef struct {
+    int    b;
+    double v;
+} binval;
+
+static int bv_cmp(const void *a, const void *b)
+{
+    const binval *x = (const binval *)a, *y = (const binval *)b;
+    if (x->b != y->b)
+        return x->b - y->b;
+    return (x->v > y->v) - (x->v < y->v);
+}
+
+static double median_sorted(const double *v, int n)
+{
+    return n > 0 ? dg_pct(v, (size_t)n, 0.50) : 0.0;
+}
+
+/*
+ * UI-поток: med/p99, медиана и p10 по корзинам дистанции, для seek -
+ * медианы коротких (<1 MB) и длинных (> 1/2 диска) хопов. Копия под
+ * локом, сортировки вне лока; пересчёт только если точек прибавилось.
+ */
+static void rnd_stats_update(rndtab *t)
+{
+    static double *v = NULL, *sv = NULL, *lv = NULL;
+    static binval *bv = NULL;
     static int     valloc = 0;
-    int            n, i;
+    int            n, i, ns = 0, nl = 0, xlog = (t->mode == DGRND_SEEK);
+    double         cap;
 
     pthread_mutex_lock(&g_lock);
-    n = g_rnd.n;
-    if (n == g_rnd_stat_n) {
+    n = t->pts.n;
+    if (n == t->stat_n) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
     if (n > valloc) {
-        double *p = (double *)realloc(v, (size_t)g_rnd.alloc * sizeof(double));
-        if (p == NULL) {
+        int a = t->pts.alloc;
+        double *p1 = (double *)realloc(v,  (size_t)a * sizeof(double));
+        double *p2 = (double *)realloc(sv, (size_t)a * sizeof(double));
+        double *p3 = (double *)realloc(lv, (size_t)a * sizeof(double));
+        binval *p4 = (binval *)realloc(bv, (size_t)a * sizeof(binval));
+        if (p1) v = p1;
+        if (p2) sv = p2;
+        if (p3) lv = p3;
+        if (p4) bv = p4;
+        if (!p1 || !p2 || !p3 || !p4) {
             pthread_mutex_unlock(&g_lock);
             return;
         }
-        v = p;
-        valloc = g_rnd.alloc;
+        valloc = a;
     }
-    for (i = 0; i < n; i++)
-        v[i] = g_rnd.a[i].val;
+    cap = rnd_cap(t, n);
+    for (i = 0; i < n; i++) {
+        const dpt *p = &t->pts.a[i];
+        v[i] = p->val;
+        bv[i].b = bin_of(xlog, p->x, cap);
+        bv[i].v = p->val;
+        if (p->x < 1048576.0)
+            sv[ns++] = p->val;
+        else if (p->x > cap * 0.5)
+            lv[nl++] = p->val;
+    }
     pthread_mutex_unlock(&g_lock);
 
     qsort(v, (size_t)n, sizeof(double), dg_dcmp);
-    g_rnd_med = dg_pct(v, (size_t)n, 0.50);
-    g_rnd_p99 = dg_pct(v, (size_t)n, 0.99);
-    g_rnd_stat_n = n;
+    t->med = dg_pct(v, (size_t)n, 0.50);
+    t->p99 = dg_pct(v, (size_t)n, 0.99);
+
+    qsort(sv, (size_t)ns, sizeof(double), dg_dcmp);
+    qsort(lv, (size_t)nl, sizeof(double), dg_dcmp);
+    t->short_med = median_sorted(sv, ns);
+    t->long_med  = median_sorted(lv, nl);
+
+    qsort(bv, (size_t)n, sizeof(binval), bv_cmp);
+    for (i = 0; i < NBIN; i++)
+        t->bn[i] = 0;
+    for (i = 0; i < n; ) {
+        int b = bv[i].b, j = i, k;
+        while (j < n && bv[j].b == b)
+            j++;
+        k = j - i;
+        t->bn[b]   = k;
+        t->bmed[b] = bv[i + (int)(0.50 * (double)(k - 1) + 0.5)].v;
+        t->blo[b]  = bv[i + (int)(0.10 * (double)(k - 1) + 0.5)].v;
+        i = j;
+    }
+    t->stat_n = n;
 }
 
 /* ------------------------------------------------ список устройств */
@@ -292,6 +424,26 @@ static NSArray *scan_disks(void)
     return a;
 }
 
+/* /dev/diskN идёт через кеш блоков ядра порциями по 4K (F_NOCACHE на
+ * него не действует) - в меню помечен, чтобы не путать с замером */
+static NSString *dev_title(NSString *path)
+{
+    if (strncmp([path UTF8String], "/dev/disk", 9) == 0)
+        return [path stringByAppendingString:@" (buffered)"];
+    return path;
+}
+
+/* путь из заголовка пункта: до первого пробела */
+static void title_to_path(NSString *t, char *out, size_t outsz)
+{
+    const char *u = [t UTF8String];
+    size_t      i;
+
+    for (i = 0; u != NULL && u[i] != 0 && u[i] != ' ' && i + 1 < outsz; i++)
+        out[i] = u[i];
+    out[i] = 0;
+}
+
 /* заполнить popup и выставить в нём sel; если sel пропал - первый диск
  * (sel перезаписывается). Возврат 1 - выбор изменился. */
 static int fill_dev_popup(NSPopUpButton *pop, char *sel, size_t selsz)
@@ -307,7 +459,7 @@ static int fill_dev_popup(NSPopUpButton *pop, char *sel, size_t selsz)
 
     for (i = 0; i < (int)[disks count]; i++) {
         NSString *t = [disks objectAtIndex:i];
-        [pop addItemWithTitle:t];
+        [pop addItemWithTitle:dev_title(t)];
         if (strcmp([t UTF8String], sel) == 0)
             idx = i;
     }
@@ -336,7 +488,8 @@ static NSColor *rgb(float r, float g, float b, float a)
 
 static NSColor *col_line(void)    { return rgb(0.13f, 0.40f, 0.82f, 1.0f); }
 static NSColor *col_fill(void)    { return rgb(0.13f, 0.40f, 0.82f, 0.13f); }
-static NSColor *col_dot(void)     { return rgb(0.10f, 0.25f, 0.55f, 0.55f); }
+static NSColor *col_dot(void)     { return rgb(0.10f, 0.25f, 0.55f, 0.50f); }
+static NSColor *col_dot_fwd(void) { return rgb(0.05f, 0.60f, 0.60f, 0.55f); }
 static NSColor *col_spike(void)   { return rgb(0.85f, 0.15f, 0.12f, 0.85f); }
 static NSColor *col_avg(void)     { return rgb(0.10f, 0.55f, 0.30f, 1.0f); }
 static NSColor *col_p99(void)     { return rgb(0.85f, 0.35f, 0.10f, 1.0f); }
@@ -447,22 +600,39 @@ static double x_step_gb(double capgb, float width)
     return 10.0 * exp;
 }
 
+/* 4096 -> "4K", 268435456 -> "256M", 4294967296 -> "4G" */
+static void fmt_bytes(double b, char *out, size_t outsz)
+{
+    if (b >= GIB)
+        snprintf(out, outsz, "%.0fG", b / GIB);
+    else if (b >= 1048576.0)
+        snprintf(out, outsz, "%.0fM", b / 1048576.0);
+    else
+        snprintf(out, outsz, "%.0fK", b / 1024.0);
+}
+
 /* ------------------------------------------------------- рисование */
 
 typedef struct {
     NSRect pv;      /* область построения */
-    double cap;     /* ось X, байты; <= 0 - неизвестна */
+    double cap;     /* правый край оси X, байты; <= 0 - неизвестен */
+    int    xlog;    /* 1 - лог-ось X от SEEK_XMIN */
     double vmax;    /* ось Y; <= 0 - данных нет, шкалы нет */
     int    ndiv;
 } plotgeo;
 
-static NSPoint geo_pt(const plotgeo *g, double off, double val)
+static float geo_x(const plotgeo *g, double x)
 {
-    double fx = (g->cap > 0.0) ? off / g->cap : 0.0;
+    return NSMinX(g->pv) + (float)x_frac(g->xlog, x, g->cap) *
+                           g->pv.size.width;
+}
+
+static NSPoint geo_pt(const plotgeo *g, double x, double val)
+{
     double fy = (g->vmax > 0.0) ? val / g->vmax : 0.0;
     if (fy > 1.0) fy = 1.0;
-    return NSMakePoint(g->pv.origin.x + (float)fx * g->pv.size.width,
-                       g->pv.origin.y + (float)fy * g->pv.size.height);
+    return NSMakePoint(geo_x(g, x),
+                       NSMinY(g->pv) + (float)fy * g->pv.size.height);
 }
 
 static NSRect plot_rect(NSRect bounds)
@@ -473,9 +643,26 @@ static NSRect plot_rect(NSRect bounds)
                       NSHeight(bounds) - padt - padb);
 }
 
+/* метка X: вертикаль сетки + тик + подпись */
+static void x_tick(const plotgeo *g, NSBezierPath *grid, NSBezierPath *ticks,
+                   float x, const char *lbl, int with_grid)
+{
+    NSSize ts = text_size(lbl, tick_attrs());
+
+    if (with_grid && x > NSMinX(g->pv) + 0.5f && x < NSMaxX(g->pv) - 0.5f) {
+        [grid moveToPoint:NSMakePoint(x, NSMinY(g->pv))];
+        [grid lineToPoint:NSMakePoint(x, NSMaxY(g->pv))];
+    }
+    [ticks moveToPoint:NSMakePoint(x, NSMinY(g->pv))];
+    [ticks lineToPoint:NSMakePoint(x, NSMinY(g->pv) - 4.0f)];
+    draw_text(lbl, NSMakePoint(x - ts.width * 0.5f, NSMinY(g->pv) - 17.0f),
+              tick_attrs());
+}
+
 /* подложка, сетка, оси и подписи; ylab - имя оси Y, ydiv - делитель
- * для подписей (1 - как есть, 1000 - µs в ms) */
-static void draw_frame(const plotgeo *g, const char *ylab, double ydiv)
+ * для подписей (1 - как есть, 1000 - µs в ms), xlab - имя оси X */
+static void draw_frame(const plotgeo *g, const char *ylab, double ydiv,
+                       const char *xlab)
 {
     NSRect pv = g->pv;
     float  x0 = NSMinX(pv), y0 = NSMinY(pv);
@@ -498,34 +685,30 @@ static void draw_frame(const plotgeo *g, const char *ylab, double ydiv)
         }
     }
 
-    if (g->cap > 0.0) {
+    if (g->cap > 0.0 && g->xlog) {
+        /* лог-ось: степени 4 от 4K, при тесноте - степени 16 */
+        double mul = 4.0, b;
+        if (geo_x(g, SEEK_XMIN * 4.0) - x0 < 34.0f)
+            mul = 16.0;
+        for (b = SEEK_XMIN; b <= g->cap * 1.0001; b *= mul) {
+            char lbl[16];
+            fmt_bytes(b, lbl, sizeof lbl);
+            x_tick(g, grid, ticks, geo_x(g, b), lbl, 1);
+        }
+    } else if (g->cap > 0.0) {
         double capgb = g->cap / GIB;
         double step  = x_step_gb(capgb, pv.size.width);
-        double gb;
         int    k;
 
-        for (k = 0; ; k++) {
-            float x;
-            char  lbl[24];
-            NSSize ts;
-
-            gb = step * (double)k;
-            if (gb > capgb + 1e-9)
-                break;
-            x = x0 + (float)(gb / capgb) * pv.size.width;
-            if (k > 0 && x < x1 - 0.5f) {
-                [grid moveToPoint:NSMakePoint(x, y0)];
-                [grid lineToPoint:NSMakePoint(x, y1)];
-            }
-            [ticks moveToPoint:NSMakePoint(x, y0)];
-            [ticks lineToPoint:NSMakePoint(x, y0 - 4.0f)];
+        for (k = 0; step * (double)k <= capgb + 1e-9; k++) {
+            double gb = step * (double)k;
+            char   lbl[24];
             if (step >= 1.0)
                 snprintf(lbl, sizeof lbl, "%.0f", gb);
             else
                 snprintf(lbl, sizeof lbl, "%.1f", gb);
-            ts = text_size(lbl, tick_attrs());
-            draw_text(lbl, NSMakePoint(x - ts.width * 0.5f, y0 - 17.0f),
-                      tick_attrs());
+            x_tick(g, grid, ticks, x0 + (float)(gb / capgb) * pv.size.width,
+                   lbl, 1);
         }
     }
 
@@ -562,15 +745,12 @@ static void draw_frame(const plotgeo *g, const char *ylab, double ydiv)
     [box setLineWidth:1.0f];
     [box stroke];
 
-    {
+    if (g->cap > 0.0) {
         NSDictionary *a = attrs(10.0f, 0,
             [NSColor colorWithCalibratedWhite:0.40f alpha:1.0f]);
-        const char *xlab = "позиция на диске, GB";
         NSSize ts = text_size(xlab, a);
-
-        if (g->cap > 0.0)
-            draw_text(xlab, NSMakePoint(x0 + (pv.size.width - ts.width) * 0.5f,
-                                        y0 - 33.0f), a);
+        draw_text(xlab, NSMakePoint(x0 + (pv.size.width - ts.width) * 0.5f,
+                                    y0 - 33.0f), a);
     }
     if (g->vmax > 0.0)
         draw_text(ylab, NSMakePoint(x0 - 4.0f, y1 + 5.0f),
@@ -618,6 +798,34 @@ static void draw_hmark(const plotgeo *g, double val, NSColor *c,
     draw_text(lbl, NSMakePoint(bg.origin.x + 2.0f, bg.origin.y), a);
 }
 
+/* легенда в правом верхнем углу над графиком: цветной квадрат + текст */
+static float draw_legend(const plotgeo *g, float right, NSColor *c,
+                         const char *lbl, int dashed_line)
+{
+    NSDictionary *a = attrs(10.0f, 0,
+        [NSColor colorWithCalibratedWhite:0.30f alpha:1.0f]);
+    NSSize ts = text_size(lbl, a);
+    float  y = NSMaxY(g->pv) + 5.0f;
+    float  x = right - ts.width;
+
+    draw_text(lbl, NSMakePoint(x, y), a);
+    [c set];
+    if (dashed_line < 0) {
+        NSRectFillUsingOperation(NSMakeRect(x - 11.0f, y + 4.0f, 6.0f, 6.0f),
+                                 NSCompositeSourceOver);
+    } else {
+        float dash[2] = {3.0f, 2.0f};
+        NSBezierPath *bp = [NSBezierPath bezierPath];
+        [bp moveToPoint:NSMakePoint(x - 18.0f, y + 7.0f)];
+        [bp lineToPoint:NSMakePoint(x - 4.0f, y + 7.0f)];
+        [bp setLineWidth:2.0f];
+        if (dashed_line)
+            [bp setLineDash:dash count:2 phase:0.0f];
+        [bp stroke];
+    }
+    return x - 32.0f;
+}
+
 static const char *idle_hint(void)
 {
     if (!g_is_root)
@@ -636,21 +844,21 @@ static const char *idle_hint(void)
     static dbuf snap = { NULL, 0, 0 };
     plotgeo g;
     double  raw = 0.0;
-    int     i, running;
+    int     i, running = (g_run == RUN_LIN);
     uint64_t bytes, us;
 
     (void)dirty;
 
     pthread_mutex_lock(&g_lock);
     pts_copy(&g_lin, &snap);
-    g.cap  = (snap.n > 0 || g_run == 1) ? g_lin_datacap : g_lin_selcap;
+    g.cap  = (snap.n > 0 || running) ? g_lin_datacap : 0.0;
     bytes  = g_lin_bytes;
     us     = g_lin_time_us;
     pthread_mutex_unlock(&g_lock);
-    running = (g_run == 1);
 
     if (g.cap <= 0.0)
         g.cap = g_lin_selcap;
+    g.xlog = 0;
 
     for (i = 0; i < snap.n; i++)
         if (snap.a[i].val > raw)
@@ -660,7 +868,7 @@ static const char *idle_hint(void)
     g.ndiv = 4;
     g.vmax = (raw > 0.0) ? axis_vmax(raw, &g.ndiv) : 0.0;
 
-    draw_frame(&g, "MB/s", 1.0);
+    draw_frame(&g, "MB/s", 1.0, "позиция на диске, GB");
 
     if (snap.n == 0) {
         draw_hint(g.pv, running ? "открываю диск..." : idle_hint());
@@ -670,12 +878,12 @@ static const char *idle_hint(void)
     {
         NSBezierPath *line = [NSBezierPath bezierPath];
         NSBezierPath *area = [NSBezierPath bezierPath];
-        NSPoint first = geo_pt(&g, snap.a[0].off, snap.a[0].val);
+        NSPoint first = geo_pt(&g, snap.a[0].x, snap.a[0].val);
         NSPoint last  = first;
 
         [area moveToPoint:NSMakePoint(first.x, NSMinY(g.pv))];
         for (i = 0; i < snap.n; i++) {
-            NSPoint p = geo_pt(&g, snap.a[i].off, snap.a[i].val);
+            NSPoint p = geo_pt(&g, snap.a[i].x, snap.a[i].val);
             if (i == 0)
                 [line moveToPoint:p];
             else
@@ -716,28 +924,40 @@ static const char *idle_hint(void)
 
 @end
 
+/* Random access / Random seek: scatter лаг vs дистанция */
 @interface RndView : NSView
+{
+    rndtab *tab;
+}
+- (void)setTab:(rndtab *)t;
 @end
 
 @implementation RndView
 
+- (void)setTab:(rndtab *)t
+{
+    tab = t;
+}
+
 - (void)drawRect:(NSRect)dirty
 {
     static dbuf snap = { NULL, 0, 0 };
+    rndtab *t = tab;
     plotgeo g;
     double  raw = 0.0, thr = 1e30;
-    int     i, over = 0, running;
+    int     i, over = 0, seek, running;
 
     (void)dirty;
+    if (t == NULL)
+        return;
+    seek    = (t->mode == DGRND_SEEK);
+    running = (g_run == t->run_id);
 
     pthread_mutex_lock(&g_lock);
-    pts_copy(&g_rnd, &snap);
-    g.cap = (snap.n > 0 || g_run == 2) ? g_rnd_datacap : g_rnd_selcap;
+    pts_copy(&t->pts, &snap);
+    g.cap = rnd_cap(t, snap.n);
     pthread_mutex_unlock(&g_lock);
-    running = (g_run == 2);
-
-    if (g.cap <= 0.0)
-        g.cap = g_rnd_selcap;
+    g.xlog = seek;
 
     for (i = 0; i < snap.n; i++)
         if (snap.a[i].val > raw)
@@ -745,17 +965,20 @@ static const char *idle_hint(void)
 
     /* единичный выброс (рекалибровка, спин-ап) не сплющивает облако:
      * шкала по 2*p99, всё выше - красной меткой у верхнего края */
-    if (snap.n >= 100 && g_rnd_p99 > 0.0) {
-        thr = g_rnd_p99;
-        if (raw > 3.0 * g_rnd_p99)
-            raw = 2.0 * g_rnd_p99;
+    if (snap.n >= 100 && t->p99 > 0.0) {
+        if (!seek)
+            thr = t->p99;
+        if (raw > 3.0 * t->p99)
+            raw = 2.0 * t->p99;
     }
 
     g.pv   = plot_rect([self bounds]);
     g.ndiv = 5;
     g.vmax = (raw > 0.0) ? axis_vmax(raw, &g.ndiv) : 0.0;
 
-    draw_frame(&g, "ms", 1000.0);
+    draw_frame(&g, "ms", 1000.0,
+               seek ? "дистанция хопа (лог. шкала)"
+                    : "дистанция от предыдущего чтения, GB");
 
     if (snap.n == 0) {
         draw_hint(g.pv, running ? "открываю диск, прогрев..." : idle_hint());
@@ -764,10 +987,12 @@ static const char *idle_hint(void)
 
     {
         NSBezierPath *dots   = [NSBezierPath bezierPath];
+        NSBezierPath *fwd    = [NSBezierPath bezierPath];
         NSBezierPath *spikes = [NSBezierPath bezierPath];
 
         for (i = 0; i < snap.n; i++) {
-            NSPoint p = geo_pt(&g, snap.a[i].off, snap.a[i].val);
+            NSPoint p = geo_pt(&g, snap.a[i].x, snap.a[i].val);
+            NSRect  r = NSMakeRect(p.x - 1.5f, p.y - 1.5f, 3.0f, 3.0f);
             if (snap.a[i].val > g.vmax) {
                 /* за шкалой: треугольник остриём вверх у края */
                 float y = NSMaxY(g.pv) - 1.0f;
@@ -777,33 +1002,79 @@ static const char *idle_hint(void)
                 [spikes closePath];
                 over++;
             } else if (snap.a[i].val > thr) {
-                [spikes appendBezierPathWithRect:
-                    NSMakeRect(p.x - 1.5f, p.y - 1.5f, 3.0f, 3.0f)];
+                [spikes appendBezierPathWithRect:r];
+            } else if (seek && snap.a[i].tag > 0) {
+                [fwd appendBezierPathWithRect:r];
             } else {
-                [dots appendBezierPathWithRect:
-                    NSMakeRect(p.x - 1.5f, p.y - 1.5f, 3.0f, 3.0f)];
+                [dots appendBezierPathWithRect:r];
             }
         }
         [col_dot() set];
         [dots fill];
+        [col_dot_fwd() set];
+        [fwd fill];
         [col_spike() set];
         [spikes fill];
     }
 
-    if (snap.n >= 20) {
-        char lbl[48];
-        snprintf(lbl, sizeof lbl, "med %.1f ms", g_rnd_med / 1000.0);
-        draw_hmark(&g, g_rnd_med, col_avg(), lbl);
-        snprintf(lbl, sizeof lbl, "p99 %.1f ms", g_rnd_p99 / 1000.0);
-        draw_hmark(&g, g_rnd_p99, col_p99(), lbl);
+    /* кривые по корзинам дистанции: медиана и p10 (≈ чистый seek) */
+    if (t->stat_n >= 50) {
+        NSBezierPath *med = [NSBezierPath bezierPath];
+        NSBezierPath *lo  = [NSBezierPath bezierPath];
+        float  dash[2] = {4.0f, 2.0f};
+        int    started = 0;
+
+        for (i = 0; i < NBIN; i++) {
+            double fx;
+            float  x;
+            NSPoint pm, pl;
+
+            if (t->bn[i] < 5)
+                continue;
+            fx = ((double)i + 0.5) / (double)NBIN;
+            x  = NSMinX(g.pv) + (float)fx * g.pv.size.width;
+            pm = geo_pt(&g, 0.0, t->bmed[i]);
+            pl = geo_pt(&g, 0.0, t->blo[i]);
+            pm.x = pl.x = x;
+            if (!started) {
+                [med moveToPoint:pm];
+                [lo moveToPoint:pl];
+                started = 1;
+            } else {
+                [med lineToPoint:pm];
+                [lo lineToPoint:pl];
+            }
+        }
+        [med setLineWidth:2.0f];
+        [med setLineJoinStyle:NSRoundLineJoinStyle];
+        [lo setLineWidth:2.0f];
+        [lo setLineJoinStyle:NSRoundLineJoinStyle];
+        [lo setLineDash:dash count:2 phase:0.0f];
+        [col_avg() set];
+        [med stroke];
+        [col_p99() set];
+        [lo stroke];
     }
 
-    if (over > 0) {
+    if (!seek && snap.n >= 20) {
         char lbl[48];
-        snprintf(lbl, sizeof lbl, "выше шкалы: %d", over);
-        draw_text(lbl, NSMakePoint(NSMaxX(g.pv) - text_size(lbl,
-                      tick_attrs()).width, NSMaxY(g.pv) + 5.0f),
-                  attrs(10.0f, 0, col_spike()));
+        snprintf(lbl, sizeof lbl, "p99 %.1f ms", t->p99 / 1000.0);
+        draw_hmark(&g, t->p99, col_spike(), lbl);
+    }
+
+    {
+        float right = NSMaxX(g.pv);
+        if (over > 0) {
+            char lbl[48];
+            snprintf(lbl, sizeof lbl, "выше шкалы: %d", over);
+            right = draw_legend(&g, right, col_spike(), lbl, -1);
+        }
+        right = draw_legend(&g, right, col_p99(), "p10 (≈ seek)", 1);
+        right = draw_legend(&g, right, col_avg(), "медиана", 0);
+        if (seek) {
+            right = draw_legend(&g, right, col_dot(), "назад", -1);
+            right = draw_legend(&g, right, col_dot_fwd(), "вперёд", -1);
+        }
     }
 }
 
@@ -833,6 +1104,10 @@ static void err_text(char *s, size_t sz, int oserr, const char *err)
         snprintf(s, sz, "Ошибка: %s", err);
 }
 
+static const char *k_noroot =
+    "Нет прав на raw-диск - перезапустите приложение и введите пароль "
+    "администратора";
+
 static void status_lin(void)
 {
     char s[320];
@@ -856,7 +1131,7 @@ static void status_lin(void)
     err[sizeof err - 1] = 0;
     pthread_mutex_unlock(&g_lock);
 
-    if (g_run == 1) {
+    if (g_run == RUN_LIN) {
         int t = (int)(time(NULL) - g_run_t0);
         if (canc)
             snprintf(s, sizeof s, "Останавливаюсь после текущего блока...");
@@ -883,9 +1158,7 @@ static void status_lin(void)
                  res.stopped ? "   [остановлено]" : "");
         set_status(g_lin_status, s, ST_DONE);
     } else if (!g_is_root) {
-        snprintf(s, sizeof s, "Нет прав на raw-диск - перезапустите "
-                              "приложение и введите пароль администратора");
-        set_status(g_lin_status, s, ST_ERROR);
+        set_status(g_lin_status, k_noroot, ST_ERROR);
     } else {
         if (g_lin_selcap > 0.0)
             snprintf(s, sizeof s,
@@ -899,60 +1172,94 @@ static void status_lin(void)
     }
 }
 
-static void status_rnd(void)
+/* seek: "короткие ... · длинные ..." для статуса */
+static void seek_summary(const rndtab *t, char *out, size_t outsz)
 {
-    char s[320];
+    snprintf(out, outsz,
+             "хопы < 1 MB: med %.1f ms   ·   > ½ диска: med %.1f ms",
+             t->short_med / 1000.0, t->long_med / 1000.0);
+}
+
+static void status_rnd(rndtab *t)
+{
+    char s[400], extra[160];
     int  n, failed, canc, oserr, elapsed;
     dgrndresult res;
     char err[256];
+    int  seek = (t->mode == DGRND_SEEK);
 
     pthread_mutex_lock(&g_lock);
-    n       = g_rnd.n;
-    failed  = g_rnd_failed;
-    oserr   = g_rnd_oserr;
-    canc    = g_rnd_cancel;
-    res     = g_rnd_res;
-    elapsed = g_rnd_elapsed;
-    strncpy(err, g_rnd_err, sizeof err);
+    n       = t->pts.n;
+    failed  = t->failed;
+    oserr   = t->oserr;
+    canc    = t->cancel;
+    res     = t->res;
+    elapsed = t->elapsed;
+    strncpy(err, t->err, sizeof err);
     err[sizeof err - 1] = 0;
     pthread_mutex_unlock(&g_lock);
 
-    if (g_run == 2) {
-        int t = (int)(time(NULL) - g_run_t0);
-        if (t < 0) t = 0;
-        if (t > g_rnd_secs_run) t = g_rnd_secs_run;
+    extra[0] = 0;
+    if (seek && t->stat_n > 0)
+        seek_summary(t, extra, sizeof extra);
+
+    if (g_run == t->run_id) {
+        int tt = (int)(time(NULL) - g_run_t0);
+        if (tt < 0) tt = 0;
+        if (tt > t->secs_run) tt = t->secs_run;
         if (canc)
             snprintf(s, sizeof s, "Останавливаюсь...");
+        else if (seek)
+            snprintf(s, sizeof s, "%s %d   ·   %d / %d с   ·   %s",
+                     "хопов", n, tt, t->secs_run, extra);
         else
             snprintf(s, sizeof s,
                      "ops %d   ·   %d / %d с   ·   med %.1f ms   ·   "
                      "p99 %.1f ms",
-                     n, t, g_rnd_secs_run,
-                     g_rnd_med / 1000.0, g_rnd_p99 / 1000.0);
-        set_status(g_rnd_status, s, ST_NORMAL);
+                     n, tt, t->secs_run, t->med / 1000.0, t->p99 / 1000.0);
+        set_status(t->status, s, ST_NORMAL);
     } else if (failed) {
         err_text(s, sizeof s, oserr, err);
-        set_status(g_rnd_status, s, ST_ERROR);
+        set_status(t->status, s, ST_ERROR);
     } else if (n > 0) {
-        snprintf(s, sizeof s,
-                 "Готово: %llu ops   ·   med %.1f ms   ·   p99 %.1f ms   ·   "
-                 "eio %llu   ·   %d:%02d%s",
-                 (unsigned long long)res.ops,
-                 res.med_us / 1000.0, res.p99_us / 1000.0,
-                 (unsigned long long)res.eio,
-                 elapsed / 60, elapsed % 60,
-                 res.stopped ? "   [остановлено]" : "");
-        set_status(g_rnd_status, s, ST_DONE);
+        if (seek)
+            snprintf(s, sizeof s,
+                     "Готово: %llu хопов   ·   %s   ·   eio %llu   ·   "
+                     "%d:%02d%s",
+                     (unsigned long long)res.ops, extra,
+                     (unsigned long long)res.eio,
+                     elapsed / 60, elapsed % 60,
+                     res.stopped ? "   [остановлено]" : "");
+        else
+            snprintf(s, sizeof s,
+                     "Готово: %llu ops   ·   med %.1f ms   ·   p99 %.1f ms   ·"
+                     "   eio %llu   ·   %d:%02d%s",
+                     (unsigned long long)res.ops,
+                     res.med_us / 1000.0, res.p99_us / 1000.0,
+                     (unsigned long long)res.eio,
+                     elapsed / 60, elapsed % 60,
+                     res.stopped ? "   [остановлено]" : "");
+        set_status(t->status, s, ST_DONE);
     } else if (!g_is_root) {
-        snprintf(s, sizeof s, "Нет прав на raw-диск - перезапустите "
-                              "приложение и введите пароль администратора");
-        set_status(g_rnd_status, s, ST_ERROR);
+        set_status(t->status, k_noroot, ST_ERROR);
     } else {
-        snprintf(s, sizeof s,
-                 "%d с случайных чтений по 4 KB по всей поверхности - "
-                 "нажмите Старт", g_rnd_secs);
-        set_status(g_rnd_status, s, ST_NORMAL);
+        if (seek)
+            snprintf(s, sizeof s,
+                     "%d с хопов от 8 KB до всей ёмкости - профиль "
+                     "\"время перемещения головки vs дистанция\"", t->secs);
+        else
+            snprintf(s, sizeof s,
+                     "%d с чтений по 4 KB в случайные точки диска - время "
+                     "случайного доступа (seek + вращение)", t->secs);
+        set_status(t->status, s, ST_NORMAL);
     }
+}
+
+static void status_all(void)
+{
+    status_lin();
+    status_rnd(&g_acc);
+    status_rnd(&g_seek);
 }
 
 /* ------------------------------------------------------- рабочие потоки */
@@ -970,7 +1277,7 @@ static void lin_seg(void *ctx, const dglinseg *seg)
 {
     (void)ctx;
     pthread_mutex_lock(&g_lock);
-    pts_add(&g_lin, (double)seg->off, mbs_of(seg->bytes, seg->time_us));
+    pts_add(&g_lin, (double)seg->off, mbs_of(seg->bytes, seg->time_us), 0);
     g_lin_bytes   += seg->bytes;
     g_lin_time_us += seg->time_us;
     g_lin_idx_done = (int)(seg->index + 1);
@@ -1010,71 +1317,80 @@ static void *lin_thread(void *arg)
 
 static void rnd_begin(void *ctx, const dgrndinfo *info)
 {
-    (void)ctx;
+    rndtab *t = (rndtab *)ctx;
     pthread_mutex_lock(&g_lock);
-    g_rnd_datacap = (double)info->capacity;
+    t->datacap = (double)info->capacity;
     pthread_mutex_unlock(&g_lock);
 }
 
 static void rnd_op(void *ctx, const dgrndop *op)
 {
-    (void)ctx;
+    rndtab *t = (rndtab *)ctx;
     pthread_mutex_lock(&g_lock);
-    pts_add(&g_rnd, (double)op->off, (double)op->us);
+    pts_add(&t->pts, (double)op->dist, (double)op->us, op->dir);
     pthread_mutex_unlock(&g_lock);
 }
 
 static void *rnd_thread(void *arg)
 {
+    rndtab     *t = (rndtab *)arg;
     dgrndcfg    cfg;
     dgrndresult res;
     char        err[256];
     int         rc;
     time_t      t0 = time(NULL);
 
-    (void)arg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.dev    = g_rnd_path;
+    cfg.dev    = t->path;
     cfg.blk    = RND_BLK;
-    cfg.secs   = g_rnd_secs_run;
+    cfg.secs   = t->secs_run;
     cfg.warmup = RND_WARMUP;
     cfg.seed   = 0;                 /* из времени/pid */
+    cfg.mode   = t->mode;
 
-    rc = dgrndcore(&cfg, rnd_begin, rnd_op, NULL, NULL,
-                   &g_rnd_cancel, &res, err, sizeof err);
+    rc = dgrndcore(&cfg, rnd_begin, rnd_op, NULL, t,
+                   &t->cancel, &res, err, sizeof err);
 
     pthread_mutex_lock(&g_lock);
-    g_rnd_failed = (rc != 0);
-    g_rnd_oserr  = res.oserr;
+    t->failed = (rc != 0);
+    t->oserr  = res.oserr;
     if (rc != 0)
-        snprintf(g_rnd_err, sizeof g_rnd_err, "%s", err);
-    g_rnd_res = res;
-    g_rnd_elapsed = (int)(time(NULL) - t0);
-    g_rnd_done = 1;
+        snprintf(t->err, sizeof t->err, "%s", err);
+    t->res = res;
+    t->elapsed = (int)(time(NULL) - t0);
+    t->done = 1;
     pthread_mutex_unlock(&g_lock);
     return NULL;
 }
 
 /* UI-поток: доступность контролов по состоянию прогона */
-static void update_controls(void)
+static void update_rnd_controls(rndtab *t)
 {
-    int idle = (g_run == 0);
+    int idle = (g_run == RUN_IDLE);
 
-    [g_lin_start setEnabled:idle];
-    [g_rnd_start setEnabled:idle];
-    [g_lin_stop setEnabled:(g_run == 1 && !g_lin_cancel)];
-    [g_rnd_stop setEnabled:(g_run == 2 && !g_rnd_cancel)];
-    [g_lin_slider setEnabled:idle];
-    [g_rnd_slider setEnabled:idle];
-    [g_lin_dev setEnabled:idle];
-    [g_rnd_dev setEnabled:idle];
+    [t->start setEnabled:idle];
+    [t->stop setEnabled:(g_run == t->run_id && !t->cancel)];
+    [t->slider setEnabled:idle];
+    [t->dev setEnabled:idle];
 }
 
-static int start_thread(void *(*fn)(void *))
+static void update_controls(void)
+{
+    int idle = (g_run == RUN_IDLE);
+
+    [g_lin_start setEnabled:idle];
+    [g_lin_stop setEnabled:(g_run == RUN_LIN && !g_lin_cancel)];
+    [g_lin_slider setEnabled:idle];
+    [g_lin_dev setEnabled:idle];
+    update_rnd_controls(&g_acc);
+    update_rnd_controls(&g_seek);
+}
+
+static int start_thread(void *(*fn)(void *), void *arg)
 {
     pthread_t th;
 
-    if (pthread_create(&th, NULL, fn, NULL) != 0)
+    if (pthread_create(&th, NULL, fn, arg) != 0)
         return 0;
     pthread_detach(th);
     return 1;
@@ -1082,11 +1398,11 @@ static int start_thread(void *(*fn)(void *))
 
 static void lin_start(void)
 {
-    if (g_run != 0)
+    if (g_run != RUN_IDLE)
         return;
 
     pthread_mutex_lock(&g_lock);
-    pts_clear(&g_lin);
+    g_lin.n = 0;
     g_lin_total = 0;
     g_lin_bytes = 0;
     g_lin_time_us = 0;
@@ -1100,14 +1416,14 @@ static void lin_start(void)
     pthread_mutex_unlock(&g_lock);
 
     g_lin_cancel = 0;
-    g_run = 1;
+    g_run = RUN_LIN;
     g_run_t0 = time(NULL);
 
     strncpy(g_lin_path, g_lin_sel, sizeof g_lin_path - 1);
     g_lin_path[sizeof g_lin_path - 1] = 0;
     g_lin_duty = g_duty;
 
-    if (!start_thread(lin_thread)) {
+    if (!start_thread(lin_thread, NULL)) {
         pthread_mutex_lock(&g_lock);
         snprintf(g_lin_err, sizeof g_lin_err, "не удалось создать поток");
         g_lin_failed = 1;
@@ -1118,64 +1434,81 @@ static void lin_start(void)
     status_lin();
 }
 
-static void rnd_start(void)
+static void rnd_start(rndtab *t)
 {
-    if (g_run != 0)
+    if (g_run != RUN_IDLE)
         return;
 
     pthread_mutex_lock(&g_lock);
-    pts_clear(&g_rnd);
-    g_rnd_failed = 0;
-    g_rnd_oserr = 0;
-    g_rnd_err[0] = 0;
-    g_rnd_done = 0;
-    g_rnd_datacap = g_rnd_selcap;
-    memset(&g_rnd_res, 0, sizeof g_rnd_res);
+    t->pts.n = 0;
+    t->failed = 0;
+    t->oserr = 0;
+    t->err[0] = 0;
+    t->done = 0;
+    t->datacap = t->selcap;
+    memset(&t->res, 0, sizeof t->res);
     pthread_mutex_unlock(&g_lock);
 
-    g_rnd_med = g_rnd_p99 = 0.0;
-    g_rnd_stat_n = -1;
-    g_rnd_cancel = 0;
-    g_run = 2;
+    t->med = t->p99 = t->short_med = t->long_med = 0.0;
+    t->stat_n = -1;
+    memset(t->bn, 0, sizeof t->bn);
+    t->cancel = 0;
+    g_run = t->run_id;
     g_run_t0 = time(NULL);
 
-    strncpy(g_rnd_path, g_rnd_sel, sizeof g_rnd_path - 1);
-    g_rnd_path[sizeof g_rnd_path - 1] = 0;
-    g_rnd_secs_run = g_rnd_secs;
+    strncpy(t->path, t->sel, sizeof t->path - 1);
+    t->path[sizeof t->path - 1] = 0;
+    t->secs_run = t->secs;
 
-    if (!start_thread(rnd_thread)) {
+    if (!start_thread(rnd_thread, t)) {
         pthread_mutex_lock(&g_lock);
-        snprintf(g_rnd_err, sizeof g_rnd_err, "не удалось создать поток");
-        g_rnd_failed = 1;
-        g_rnd_done = 1;
+        snprintf(t->err, sizeof t->err, "не удалось создать поток");
+        t->failed = 1;
+        t->done = 1;
         pthread_mutex_unlock(&g_lock);
     }
     update_controls();
-    status_rnd();
+    status_rnd(t);
 }
 
 /* UI-поток: выбор в popup поменялся - ёмкость для оси и подсказки */
-static void sel_changed(int lin)
+static void lin_sel_changed(void)
 {
-    if (lin) {
-        g_lin_selcap = dg_probe_capacity(g_lin_sel);
-        status_lin();
-        [g_lin_view setNeedsDisplay:YES];
-    } else {
-        g_rnd_selcap = dg_probe_capacity(g_rnd_sel);
-        status_rnd();
-        [g_rnd_view setNeedsDisplay:YES];
-    }
+    g_lin_selcap = dg_probe_capacity(g_lin_sel);
+    status_lin();
+    [g_lin_view setNeedsDisplay:YES];
+}
+
+static void rnd_sel_changed(rndtab *t)
+{
+    t->selcap = dg_probe_capacity(t->sel);
+    t->stat_n = -1;                 /* корзины зависят от ёмкости */
+    status_rnd(t);
+    [t->view setNeedsDisplay:YES];
 }
 
 static void refresh_devs(void)
 {
-    if (g_run != 0)
+    if (g_run != RUN_IDLE)
         return;                     /* popup-ы заблокированы - не трогаем */
     if (fill_dev_popup(g_lin_dev, g_lin_sel, sizeof g_lin_sel))
-        sel_changed(1);
-    if (fill_dev_popup(g_rnd_dev, g_rnd_sel, sizeof g_rnd_sel))
-        sel_changed(0);
+        lin_sel_changed();
+    if (fill_dev_popup(g_acc.dev, g_acc.sel, sizeof g_acc.sel))
+        rnd_sel_changed(&g_acc);
+    if (fill_dev_popup(g_seek.dev, g_seek.sel, sizeof g_seek.sel))
+        rnd_sel_changed(&g_seek);
+}
+
+/* по контролу - его random-вкладка (NULL - Linear) */
+static rndtab *rndtab_of(id ctl)
+{
+    if (ctl == g_acc.start || ctl == g_acc.stop || ctl == g_acc.slider ||
+        ctl == g_acc.dev)
+        return &g_acc;
+    if (ctl == g_seek.start || ctl == g_seek.stop || ctl == g_seek.slider ||
+        ctl == g_seek.dev)
+        return &g_seek;
+    return NULL;
 }
 
 /* ------------------------------------------------------------ контроллер */
@@ -1227,7 +1560,7 @@ static void refresh_devs(void)
 - (void)linStop:(id)s
 {
     (void)s;
-    if (g_run == 1) {
+    if (g_run == RUN_LIN) {
         g_lin_cancel = 1;
         update_controls();
         status_lin();
@@ -1236,17 +1569,20 @@ static void refresh_devs(void)
 
 - (void)rndStart:(id)s
 {
-    (void)s;
-    rnd_start();
+    rndtab *t = rndtab_of(s);
+    if (t != NULL)
+        rnd_start(t);
 }
 
 - (void)rndStop:(id)s
 {
-    (void)s;
-    if (g_run == 2) {
-        g_rnd_cancel = 1;
+    rndtab *t = rndtab_of(s);
+    if (t == NULL)
+        t = rndtab_of_run(g_run);   /* dev-хук -stop шлёт nil */
+    if (t != NULL && g_run == t->run_id) {
+        t->cancel = 1;
         update_controls();
-        status_rnd();
+        status_rnd(t);
     }
 }
 
@@ -1256,32 +1592,42 @@ static void refresh_devs(void)
     g_duty = [s intValue];
     snprintf(lbl, sizeof lbl, "%d %%", g_duty);
     [g_duty_val setStringValue:[NSString stringWithUTF8String:lbl]];
-    if (g_run == 0)
+    if (g_run == RUN_IDLE)
         status_lin();
 }
 
 - (void)secsChanged:(id)s
 {
-    char lbl[64];
-    g_rnd_secs = [s intValue];
-    snprintf(lbl, sizeof lbl, "%d с", g_rnd_secs);
-    [g_secs_val setStringValue:[NSString stringWithUTF8String:lbl]];
-    if (g_run == 0)
-        status_rnd();
+    rndtab *t = rndtab_of(s);
+    char    lbl[64];
+
+    if (t == NULL)
+        return;
+    t->secs = [s intValue];
+    snprintf(lbl, sizeof lbl, "%d с", t->secs);
+    [t->val setStringValue:[NSString stringWithUTF8String:lbl]];
+    if (g_run == RUN_IDLE)
+        status_rnd(t);
 }
 
 - (void)devChanged:(id)s
 {
-    NSString   *t = [s titleOfSelectedItem];
-    const char *u;
-    int         lin = (s == g_lin_dev);
-    char       *sel = lin ? g_lin_sel : g_rnd_sel;
+    NSString *title = [s titleOfSelectedItem];
+    rndtab   *t = rndtab_of(s);
+    char      path[64];
 
-    if (t == nil || (u = [t UTF8String]) == NULL || u[0] != '/')
+    if (title == nil)
         return;
-    strncpy(sel, u, 63);
-    sel[63] = 0;
-    sel_changed(lin);
+    title_to_path(title, path, sizeof path);
+    if (path[0] != '/')
+        return;
+    if (t == NULL) {
+        strcpy(g_lin_sel, path);
+        lin_sel_changed();
+    } else {
+        strcpy(t->sel, path);
+        rnd_sel_changed(t);
+    }
 }
 
 - (void)appActive:(NSNotification *)n
@@ -1309,43 +1655,42 @@ static void refresh_devs(void)
 
 - (void)tick:(NSTimer *)timer
 {
-    int ldone, rdone;
+    int     done = 0;
+    rndtab *rt;
 
     (void)timer;
 
+    rt = rndtab_of_run(g_run);
     pthread_mutex_lock(&g_lock);
-    ldone = g_lin_done;
-    rdone = g_rnd_done;
+    if (g_run == RUN_LIN)
+        done = g_lin_done;
+    else if (rt != NULL)
+        done = rt->done;
     pthread_mutex_unlock(&g_lock);
 
-    rnd_stats_update();
+    rnd_stats_update(&g_acc);
+    rnd_stats_update(&g_seek);
 
-    if (g_run == 1 && ldone) {
-        g_run = 0;
+    if (g_run != RUN_IDLE && done) {
+        int was = g_run;
+        g_run = RUN_IDLE;
         update_controls();
         if (g_again) {
             g_again = 0;
-            printf("again: restart linear\n");
+            printf("again: restart %d\n", was);
             fflush(stdout);
-            lin_start();
-        }
-    }
-    if (g_run == 2 && rdone) {
-        g_run = 0;
-        update_controls();
-        if (g_again) {
-            g_again = 0;
-            printf("again: restart random\n");
-            fflush(stdout);
-            rnd_start();
+            if (was == RUN_LIN)
+                lin_start();
+            else
+                rnd_start(rt);
         }
     }
 
     if (g_stop_at > 0 && time(NULL) >= g_stop_at) {
         g_stop_at = 0;
-        if (g_run == 1)
+        if (g_run == RUN_LIN)
             [self linStop:nil];
-        if (g_run == 2)
+        else if (g_run != RUN_IDLE)
             [self rndStop:nil];
     }
 
@@ -1357,21 +1702,21 @@ static void refresh_devs(void)
         return;
     }
 
-    status_lin();
-    status_rnd();
+    status_all();
     [g_lin_view setNeedsDisplay:YES];
-    [g_rnd_view setNeedsDisplay:YES];
+    [g_acc.view setNeedsDisplay:YES];
+    [g_seek.view setNeedsDisplay:YES];
 
     if (g_cycle) {
         g_cycle_ticks++;
         if (g_cycle_ticks % (int)(3.0 / TICK_SEC) == 0) {
             int cur = (int)[g_tabs indexOfTabViewItem:
                                 [g_tabs selectedTabViewItem]];
-            int nxt = (cur == 0) ? 1 : 0;
+            int nxt = (cur + 1) % 3;
             [g_tabs selectTabViewItemAtIndex:nxt];
             pthread_mutex_lock(&g_lock);
-            printf("cycle: tab %d -> %d   lin_n %d   rnd_n %d\n",
-                   cur, nxt, g_lin.n, g_rnd.n);
+            printf("cycle: tab %d -> %d   lin_n %d   acc_n %d   seek_n %d\n",
+                   cur, nxt, g_lin.n, g_acc.pts.n, g_seek.pts.n);
             fflush(stdout);
             pthread_mutex_unlock(&g_lock);
         }
@@ -1394,14 +1739,19 @@ static void refresh_devs(void)
 /* дать ядру выйти из pread и закрыть fd; не дольше секунды */
 - (void)applicationWillTerminate:(NSNotification *)n
 {
-    int i, done = 1;
+    rndtab *rt = rndtab_of_run(g_run);
+    int     i, done = 1;
 
     (void)n;
     g_lin_cancel = 1;
-    g_rnd_cancel = 1;
+    g_acc.cancel = 1;
+    g_seek.cancel = 1;
     for (i = 0; i < 20; i++) {
         pthread_mutex_lock(&g_lock);
-        done = (g_run != 1 || g_lin_done) && (g_run != 2 || g_rnd_done);
+        if (g_run == RUN_LIN)
+            done = g_lin_done;
+        else if (rt != NULL)
+            done = rt->done;
         pthread_mutex_unlock(&g_lock);
         if (done)
             break;
@@ -1412,6 +1762,13 @@ static void refresh_devs(void)
 @end
 
 /* ------------------------------------------------------------ сборка UI */
+
+static void tip(NSView *v, const char *s)
+{
+    /* NSView setToolTip: - с 10.0; ярлыки вкладок тултипов не умеют
+     * до 10.6, поэтому подсказки висят на контролах и графике */
+    [v setToolTip:[NSString stringWithUTF8String:s]];
+}
 
 static NSTextField *make_label(NSView *v, const char *txt,
                                float x, float y, float w, int right)
@@ -1445,51 +1802,63 @@ static NSButton *make_button(NSView *v, Controller *ctl, const char *title,
     return [b autorelease];
 }
 
+static const char *k_tip_dev =
+    "Устройство для замера.\n"
+    "/dev/rdiskN - raw-нода: чтение идёт прямо с диска, запросами "
+    "нашего размера. Для замера - только она.\n"
+    "/dev/diskN (buffered) - блочная нода: через кеш ядра порциями по "
+    "4 KB, F_NOCACHE на неё не действует. Только для сравнения.";
+
 /*
  * Вкладка: ряд контролов (диск, слайдер, Старт/Стоп), статус-строка,
- * график на остальное место. lin = 1 - Linear, 0 - Random.
+ * график на остальное место. t == NULL - Linear read, иначе random.
  */
-static NSView *make_tab(Controller *ctl, NSSize sz, int lin)
+static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
 {
     NSView        *v = [[NSView alloc] initWithFrame:
                             NSMakeRect(0.0f, 0.0f, sz.width, sz.height)];
     float          h = sz.height, w = sz.width;
     float          y = h - 36.0f;
+    int            lin = (t == NULL);
     NSPopUpButton *pop;
     NSSlider      *sl;
     NSTextField   *val, *st;
     NSView        *gv;
+    NSButton      *bstart, *bstop;
+    char           lbl[32];
 
     make_label(v, "Диск:", 10.0f, y + 4.0f, 40.0f, 1);
     pop = [[NSPopUpButton alloc]
-        initWithFrame:NSMakeRect(54.0f, y - 1.0f, 170.0f, 26.0f) pullsDown:NO];
+        initWithFrame:NSMakeRect(54.0f, y - 1.0f, 186.0f, 26.0f) pullsDown:NO];
     [pop setTarget:ctl];
     [pop setAction:@selector(devChanged:)];
     [pop setAutoresizingMask:NSViewMinYMargin];
+    tip(pop, k_tip_dev);
     [v addSubview:pop];
     [pop release];
 
-    make_label(v, lin ? "Duty:" : "Время:", 236.0f, y + 4.0f, 52.0f, 1);
+    make_label(v, lin ? "Duty:" : "Время:", 248.0f, y + 4.0f, 52.0f, 1);
     sl = [[NSSlider alloc] initWithFrame:
-        NSMakeRect(294.0f, y + 1.0f, 180.0f, 22.0f)];
-    [sl setMinValue:lin ? 10.0 : 5.0];
+        NSMakeRect(306.0f, y + 1.0f, 170.0f, 22.0f)];
+    [sl setMinValue:lin ? 1.0 : 5.0];
     [sl setMaxValue:lin ? 100.0 : 120.0];
-    [sl setIntValue:lin ? g_duty : g_rnd_secs];
+    [sl setIntValue:lin ? g_duty : t->secs];
     [sl setTarget:ctl];
     [sl setAction:lin ? @selector(dutyChanged:) : @selector(secsChanged:)];
     [sl setAutoresizingMask:NSViewMinYMargin];
+    tip(sl, lin ? "Какую долю поверхности прочитать: сегменты по 32 MB "
+                  "равномерно по всему диску. 5% - быстрый профиль зон, "
+                  "100% - сплошной проход."
+                : "Длительность прогона в секундах.");
     [v addSubview:sl];
     [sl release];
 
-    {
-        char lbl[32];
-        if (lin)
-            snprintf(lbl, sizeof lbl, "%d %%", g_duty);
-        else
-            snprintf(lbl, sizeof lbl, "%d с", g_rnd_secs);
-        val = make_label(v, lbl, 480.0f, y + 4.0f, 60.0f, 0);
-        [val setFont:[NSFont boldSystemFontOfSize:12.0f]];
-    }
+    if (lin)
+        snprintf(lbl, sizeof lbl, "%d %%", g_duty);
+    else
+        snprintf(lbl, sizeof lbl, "%d с", t->secs);
+    val = make_label(v, lbl, 482.0f, y + 4.0f, 60.0f, 0);
+    [val setFont:[NSFont boldSystemFontOfSize:12.0f]];
 
     st = [[NSTextField alloc]
         initWithFrame:NSMakeRect(14.0f, h - 62.0f, w - 28.0f, 17.0f)];
@@ -1507,22 +1876,49 @@ static NSView *make_tab(Controller *ctl, NSSize sz, int lin)
     [v addSubview:gv];
     [gv release];
 
+    bstart = make_button(v, ctl, "Старт",
+                         lin ? @selector(linStart:) : @selector(rndStart:),
+                         w - 206.0f, y - 4.0f);
+    bstop  = make_button(v, ctl, "Стоп",
+                         lin ? @selector(linStop:) : @selector(rndStop:),
+                         w - 108.0f, y - 4.0f);
+    tip(bstop, "Остановить прогон; уже снятые точки остаются на графике.");
+
     if (lin) {
         g_lin_dev = pop; g_lin_slider = sl; g_duty_val = val;
         g_lin_status = st; g_lin_view = gv;
-        g_lin_start = make_button(v, ctl, "Старт", @selector(linStart:),
-                                  w - 206.0f, y - 4.0f);
-        g_lin_stop  = make_button(v, ctl, "Стоп", @selector(linStop:),
-                                  w - 108.0f, y - 4.0f);
+        g_lin_start = bstart; g_lin_stop = bstop;
+        tip(bstart, "Linear read: сегменты по 32 MB блоками 1 MB от начала "
+                    "до конца диска. Кривая MB/s показывает зоны: снаружи "
+                    "быстрее, к центру медленнее.");
+        tip(gv, "Скорость линейного чтения (MB/s) по позиции на диске.\n"
+                "Пунктир - средняя скорость.");
         fill_dev_popup(pop, g_lin_sel, sizeof g_lin_sel);
     } else {
-        g_rnd_dev = pop; g_rnd_slider = sl; g_secs_val = val;
-        g_rnd_status = st; g_rnd_view = gv;
-        g_rnd_start = make_button(v, ctl, "Старт", @selector(rndStart:),
-                                  w - 206.0f, y - 4.0f);
-        g_rnd_stop  = make_button(v, ctl, "Стоп", @selector(rndStop:),
-                                  w - 108.0f, y - 4.0f);
-        fill_dev_popup(pop, g_rnd_sel, sizeof g_rnd_sel);
+        t->dev = pop; t->slider = sl; t->val = val;
+        t->status = st; t->view = gv;
+        t->start = bstart; t->stop = bstop;
+        [(RndView *)gv setTab:t];
+        if (t->mode == DGRND_SEEK) {
+            tip(bstart, "Random seek: цепочка хопов - следующее чтение 4 KB "
+                        "на +-d от предыдущего, d log-равномерно от 8 KB до "
+                        "всей ёмкости. Меряет время перемещения головки в "
+                        "зависимости от дистанции.");
+            tip(gv, "Время хопа (ms) vs дистанция (лог. шкала).\n"
+                    "Зелёная линия - медиана по дистанции (seek + "
+                    "в среднем полоборота), оранжевый пунктир - p10, "
+                    "близко к чистому seek.\n"
+                    "Короткие хопы вперёд могут попасть в кеш диска "
+                    "(доли ms).");
+        } else {
+            tip(bstart, "Random access: чтения 4 KB в равномерно случайные "
+                        "точки всего диска. Классическое время случайного "
+                        "доступа = seek + ожидание вращения + передача.");
+            tip(gv, "Время доступа (ms) vs дистанция от предыдущего "
+                    "чтения.\nКрасные - выше p99; линии - медиана и p10 по "
+                    "дистанции.");
+        }
+        fill_dev_popup(pop, t->sel, sizeof t->sel);
     }
     return [v autorelease];
 }
@@ -1622,6 +2018,15 @@ static int has_arg(int argc, char **argv, const char *a)
     return 0;
 }
 
+static void add_tab(Controller *ctl, NSSize sz, rndtab *t, const char *label)
+{
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:nil];
+    [item setLabel:[NSString stringWithUTF8String:label]];
+    [item setView:make_tab(ctl, sz, t)];
+    [g_tabs addTabViewItem:item];
+    [item release];
+}
+
 int main(int argc, char *argv[])
 {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
@@ -1631,9 +2036,8 @@ int main(int argc, char *argv[])
     Controller    *ctl;
     NSMenu        *menu, *submenu;
     NSMenuItem    *mi;
-    NSTabViewItem *item;
     NSTimer       *timer;
-    NSRect         cr;
+    NSSize         csz;
     int            sized = 0, i;
 
     /* -devs: только список дисков, без окна и без прав */
@@ -1652,6 +2056,9 @@ int main(int argc, char *argv[])
         return 0;
     }
     g_is_root = (geteuid() == 0) ? 1 : 0;
+
+    rndtab_init(&g_acc,  DGRND_ACCESS, RUN_ACC,  "Random access", 30);
+    rndtab_init(&g_seek, DGRND_SEEK,   RUN_SEEK, "Random seek",   30);
 
     /* dev-хук: -w N -h N задают стартовый размер (проверка раскладки) */
     for (i = 1; i + 1 < argc; i++) {
@@ -1676,7 +2083,7 @@ int main(int argc, char *argv[])
             action:NULL keyEquivalent:[NSString stringWithUTF8String:""]];
         submenu = [[NSMenu alloc] initWithTitle:
             [NSString stringWithUTF8String:"DiskGraph"]];
-        mi = [submenu addItemWithTitle:
+        [submenu addItemWithTitle:
             [NSString stringWithUTF8String:"Закрыть окно"]
             action:@selector(performClose:)
             keyEquivalent:[NSString stringWithUTF8String:"w"]];
@@ -1706,7 +2113,7 @@ int main(int argc, char *argv[])
              defer:NO];
     [win setTitle:[NSString stringWithUTF8String:"DiskGraph"]];
     g_win = win;
-    [win setMinSize:NSMakeSize(820.0f, 520.0f)];
+    [win setMinSize:NSMakeSize(840.0f, 520.0f)];
     root = [[[NSView alloc] initWithFrame:rc] autorelease];
     [root setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win setContentView:root];
@@ -1717,49 +2124,51 @@ int main(int argc, char *argv[])
     [g_tabs setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [root addSubview:g_tabs];
 
-    cr = [g_tabs contentRect];
-
-    item = [[NSTabViewItem alloc] initWithIdentifier:nil];
-    [item setLabel:[NSString stringWithUTF8String:"Linear"]];
-    [item setView:make_tab(ctl, cr.size, 1)];
-    [g_tabs addTabViewItem:item];
-    [item release];
-
-    item = [[NSTabViewItem alloc] initWithIdentifier:nil];
-    [item setLabel:[NSString stringWithUTF8String:"Random"]];
-    [item setView:make_tab(ctl, cr.size, 0)];
-    [g_tabs addTabViewItem:item];
-    [item release];
+    csz = [g_tabs contentRect].size;
+    add_tab(ctl, csz, NULL,    "Linear read");
+    add_tab(ctl, csz, &g_acc,  "Random access");
+    add_tab(ctl, csz, &g_seek, "Random seek");
     [ctl windowDidResize:nil];
 
-    g_lin_selcap = dg_probe_capacity(g_lin_sel);
-    g_rnd_selcap = dg_probe_capacity(g_rnd_sel);
+    g_lin_selcap  = dg_probe_capacity(g_lin_sel);
+    g_acc.selcap  = dg_probe_capacity(g_acc.sel);
+    g_seek.selcap = dg_probe_capacity(g_seek.sel);
     update_controls();
-    status_lin();
-    status_rnd();
+    status_all();
 
-    /* dev-хуки: -ldev/-rdev PATH - диск вкладки, -lin / -rnd стартуют
-     * реальный прогон, -cycle щёлкает вкладки и печатает счётчики */
+    /* dev-хуки: -ldev/-adev/-sdev PATH - диск вкладки; -lin/-acc/-seek
+     * стартуют реальный прогон; -cycle щёлкает вкладки и печатает
+     * счётчики */
     for (i = 1; i + 1 < argc; i++) {
-        char *sel = NULL;
-        if (strcmp(argv[i], "-ldev") == 0)
-            sel = g_lin_sel;
-        else if (strcmp(argv[i], "-rdev") == 0)
-            sel = g_rnd_sel;
-        if (sel != NULL) {
-            strncpy(sel, argv[i + 1], 63);
-            sel[63] = 0;
-            fill_dev_popup(sel == g_lin_sel ? g_lin_dev : g_rnd_dev, sel, 64);
-            sel_changed(sel == g_lin_sel);
+        rndtab *t = NULL;
+        if (strcmp(argv[i], "-ldev") == 0) {
+            strncpy(g_lin_sel, argv[i + 1], sizeof g_lin_sel - 1);
+            fill_dev_popup(g_lin_dev, g_lin_sel, sizeof g_lin_sel);
+            lin_sel_changed();
+        } else if (strcmp(argv[i], "-adev") == 0) {
+            t = &g_acc;
+        } else if (strcmp(argv[i], "-sdev") == 0) {
+            t = &g_seek;
+        }
+        if (t != NULL) {
+            strncpy(t->sel, argv[i + 1], sizeof t->sel - 1);
+            fill_dev_popup(t->dev, t->sel, sizeof t->sel);
+            rnd_sel_changed(t);
         }
     }
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-lin") == 0) {
             [g_tabs selectTabViewItemAtIndex:0];
             lin_start();
-        } else if (strcmp(argv[i], "-rnd") == 0) {
+        } else if (strcmp(argv[i], "-acc") == 0) {
             [g_tabs selectTabViewItemAtIndex:1];
-            rnd_start();
+            rnd_start(&g_acc);
+        } else if (strcmp(argv[i], "-seek") == 0) {
+            [g_tabs selectTabViewItemAtIndex:2];
+            rnd_start(&g_seek);
+        } else if (strcmp(argv[i], "-tab") == 0 && i + 1 < argc) {
+            [g_tabs selectTabViewItemAtIndex:atoi(argv[i + 1])];
+            i++;
         } else if (strcmp(argv[i], "-stop") == 0 && i + 1 < argc) {
             g_stop_at = time(NULL) + atoi(argv[i + 1]);
             i++;

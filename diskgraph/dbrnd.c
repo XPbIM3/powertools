@@ -10,6 +10,8 @@
  *   ...
  *   ---  ops 700  med 14.30 ms  p99 32.10 ms  avg 15.20 ms  eio 0  time 0:10
  *
+ * -S - режим хопов (seek): строка на хоп  S <дистанция> <+|-> <ms>
+ *
  * Только ЧТЕНИЕ. Запись не выполняется никогда.
  */
 #include "dgrndcore.h"
@@ -86,6 +88,16 @@ static void fmt_ms(uint64_t us, char *out, size_t outsz)
         snprintf(out, outsz, "%.0f us", (double)us);
 }
 
+static void fmt_dist(uint64_t b, char *out, size_t outsz)
+{
+    if (b >= 1073741824ULL)
+        snprintf(out, outsz, "%7.2f G", (double)b / 1073741824.0);
+    else if (b >= 1048576ULL)
+        snprintf(out, outsz, "%7.2f M", (double)b / 1048576.0);
+    else
+        snprintf(out, outsz, "%7.2f K", (double)b / 1024.0);
+}
+
 /* ------------------------------------------------------- stdout-sink */
 
 typedef struct {
@@ -93,6 +105,7 @@ typedef struct {
     uint64_t    blk;
     int         secs;
     int         warmup;
+    int         mode;
 } outctx;
 
 static void out_begin(void *ctx, const dgrndinfo *info)
@@ -102,19 +115,25 @@ static void out_begin(void *ctx, const dgrndinfo *info)
     g_t0 = time(NULL);
     printf("dbrnd 1.0  dev %s  capacity %.2f G\n",
            c->dev, (double)info->capacity / 1073741824.0);
-    printf("  block %.2f K  %d s  warmup %d  seed %" PRIu64 "\n",
-           (double)c->blk / 1024.0, c->secs, c->warmup, info->seed);
+    printf("  block %.2f K  %d s  warmup %d  seed %" PRIu64 "%s\n",
+           (double)c->blk / 1024.0, c->secs, c->warmup, info->seed,
+           c->mode == DGRND_SEEK ? "  seek hops" : "");
     fflush(stdout);
 }
 
 static void out_op(void *ctx, const dgrndop *op)
 {
+    outctx *c = (outctx *)ctx;
     char gb[24], ms[24];
 
-    (void)ctx;
-    fmt_gb(op->off, gb, sizeof gb);
     fmt_ms(op->us, ms, sizeof ms);
-    printf("R %s G %8s\n", gb, ms);
+    if (c->mode == DGRND_SEEK) {
+        fmt_dist(op->dist, gb, sizeof gb);
+        printf("S %s  %c %8s\n", gb, op->dir > 0 ? '+' : '-', ms);
+    } else {
+        fmt_gb(op->off, gb, sizeof gb);
+        printf("R %s G %8s\n", gb, ms);
+    }
     fflush(stdout);
 }
 
@@ -140,18 +159,20 @@ int main(int argc, char **argv)
     uint64_t    seed   = (uint64_t)time(NULL) ^ (uint64_t)getpid();
     int         secs   = DEFAULT_SECS;
     int         warmup = DEFAULT_WARMUP;
+    int         mode   = DGRND_ACCESS;
     int         ch, rc;
     char        err[256];
     const char *dev = DEFAULT_DEV;
     struct sigaction sa;
 
-    while ((ch = getopt(argc, argv, "d:B:T:w:s:h")) != -1) {
+    while ((ch = getopt(argc, argv, "d:B:T:w:s:Sh")) != -1) {
         switch (ch) {
         case 'd': dev    = optarg;   break;
         case 'B': rblk   = parse_size(optarg); break;
         case 'T': secs   = atoi(optarg);   break;
         case 'w': warmup = atoi(optarg);   break;
         case 's': seed   = parse_size(optarg); break;
+        case 'S': mode   = DGRND_SEEK; break;
         case 'h':
             printf("dbrnd 1.0 - timed random read test "
                    "(Mac OS X 10.2..10.5 PPC)\n\n"
@@ -161,6 +182,8 @@ int main(int argc, char **argv)
                    "  -w N      warmup ops         default 16 "
                    "(not recorded)\n"
                    "  -s N      rng seed           default clock\n"
+                   "  -S        seek hops: +-d from the last read, d "
+                   "log-uniform 8K..capacity\n"
                    "  -h        help\n");
             return 0;
         default:
@@ -190,11 +213,13 @@ int main(int argc, char **argv)
     cfg.secs   = secs;
     cfg.warmup = warmup;
     cfg.seed   = seed;
+    cfg.mode   = mode;
 
     out.dev    = dev;
     out.blk    = rblk;
     out.secs   = secs;
     out.warmup = warmup;
+    out.mode   = mode;
 
     rc = dgrndcore(&cfg, out_begin, out_op, out_err, &out,
                    &g_stop, &res, err, sizeof err);

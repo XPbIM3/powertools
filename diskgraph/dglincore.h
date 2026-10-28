@@ -25,7 +25,7 @@ typedef struct {
     const char *dev;     /* "/dev/rdiskN" (raw)                 */
     uint64_t    seg;     /* чанк (сегмент), байты               */
     uint64_t    blk;     /* блок чтения, байты                  */
-    int         duty;    /* 10..100 %, 100 = сплошной проход    */
+    int         duty;    /* 1..100 %, 100 = сплошной проход     */
     uint64_t    extent;  /* 0 = вся ёмкость                     */
 } dglincfg;
 

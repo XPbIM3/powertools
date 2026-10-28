@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 
 #define SECT 512ULL
 
@@ -35,6 +36,41 @@ static uint64_t rng_next(void)
     return x * 2685821657736338717ULL;
 }
 
+/* равномерно [0,1) из 53 старших бит */
+static double rng_unit(void)
+{
+    return (double)(rng_next() >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/*
+ * Следующая позиция цепочки хопов: d log-равномерно [dmin, dmax],
+ * направление случайное; не влезает в сторону - в другую; не влезает
+ * никуда - хоп до дальнего края. Всё в слотах по 512 байт.
+ */
+static uint64_t seek_next(uint64_t cur, uint64_t nslots, uint64_t dmin)
+{
+    uint64_t last = nslots - 1;
+    uint64_t dmax = last;
+    uint64_t d;
+    int      fwd;
+
+    if (dmax <= dmin)
+        return (cur == 0) ? last : 0;
+    d = (uint64_t)((double)dmin * pow((double)dmax / (double)dmin,
+                                      rng_unit()));
+    if (d < dmin) d = dmin;
+    if (d > dmax) d = dmax;
+
+    fwd = (int)(rng_next() >> 63);
+    if (fwd && d > last - cur)
+        fwd = 0;
+    else if (!fwd && d > cur)
+        fwd = 1;
+    if (fwd ? d > last - cur : d > cur)   /* не влез ни туда, ни туда */
+        return (cur > last - cur) ? 0 : last;
+    return fwd ? cur + d : cur - d;
+}
+
 /* ------------------------------------------------------------ core */
 
 int dgrndcore(const dgrndcfg *cfg,
@@ -47,7 +83,7 @@ int dgrndcore(const dgrndcfg *cfg,
               char *errbuf, size_t errlen)
 {
     int      fd = -1;
-    uint64_t rblk, cap, nslots, off, seed;
+    uint64_t rblk, cap, nslots, off, seed, prev = 0, dmin;
     char    *buf = NULL;
     double  *lat = NULL;
     size_t   lcap = 1 << 12, ln = 0;
@@ -89,6 +125,8 @@ int dgrndcore(const dgrndcfg *cfg,
         goto out;
     }
     nslots = (cap - rblk) / SECT + 1;
+    /* короче 8K (и не короче двух блоков) хоп - почти линейное чтение */
+    dmin = (rblk * 2 > 8192 ? rblk * 2 : 8192) / SECT;
 
     info.capacity = cap;
     info.slots    = nslots;
@@ -121,6 +159,7 @@ int dgrndcore(const dgrndcfg *cfg,
             wo = (rng_next() % nslots) * SECT;
             if (pread(fd, buf, (size_t)rblk, (off_t)wo) < 0)
                 eio++;
+            prev = wo;
         }
     }
 
@@ -133,7 +172,10 @@ int dgrndcore(const dgrndcfg *cfg,
         if (time(NULL) - t0wall >= (time_t)cfg->secs)
             break;
 
-        off = (rng_next() % nslots) * SECT;
+        if (cfg->mode == DGRND_SEEK)
+            off = seek_next(prev / SECT, nslots, dmin) * SECT;
+        else
+            off = (rng_next() % nslots) * SECT;
 
         t0 = dg_now_us();
         r = pread(fd, buf, (size_t)rblk, (off_t)off);
@@ -148,6 +190,7 @@ int dgrndcore(const dgrndcfg *cfg,
             if (on_err != NULL)
                 on_err(ctx, &e);
             eio++;
+            prev = off;
             continue;
         }
         if (r == 0)
@@ -162,8 +205,11 @@ int dgrndcore(const dgrndcfg *cfg,
             op.index = ops;
             op.off   = off;
             op.us    = dt;
+            op.dist  = (off >= prev) ? off - prev : prev - off;
+            op.dir   = (off >= prev) ? 1 : -1;
             on_op(ctx, &op);
         }
+        prev = off;
 
         if (ln == lcap) {
             double *nl = (double *)realloc(lat, (lcap << 1) * sizeof(double));

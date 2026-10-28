@@ -55,8 +55,8 @@ int dglincore(const dglincfg *cfg,
                  (unsigned long long)seg, (unsigned long long)blk);
         return -1;
     }
-    if (cfg->duty < 10 || cfg->duty > 100) {
-        snprintf(errbuf, errlen, "duty percent must be 10..100");
+    if (cfg->duty < 1 || cfg->duty > 100) {
+        snprintf(errbuf, errlen, "duty percent must be 1..100");
         return -1;
     }
 
