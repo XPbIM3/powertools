@@ -1,17 +1,20 @@
 /*
- * diskgraph.m - UI DiskGraph: вкладки Linear read / Random access /
- *               Random seek на РЕАЛЬНЫХ замерах через dglincore/dgrndcore
+ * diskgraph.m - UI DiskGraph: вкладки Sequential read / Access map /
+ *               Seek profile на РЕАЛЬНЫХ замерах через dglincore/dgrndcore
  *               + вкладка SMART на ядре ../smartinfo/smartcore (только
  *               чтение: статус, атрибуты, пороги)
  *
  * Фронт и бэк скрещены: вкладки зовут те же ядра, что и консольные
  * dblin/dbrnd, но данные приходят не в stdout, а в sink-калбеки:
- *   - Linear read   : сегмент -> точка (позиция, MB/s), кривая;
- *   - Random access : оп -> точка (дистанция от прошлого чтения, лаг),
- *                     позиции равномерно по диску (время доступа);
- *   - Random seek   : хоп -> точка (дистанция хопа, лаг) на лог-оси X,
- *                     дистанции log-равномерно 8K..ёмкость (профиль
- *                     перемещения головки).
+ *   - Sequential read : сегмент -> точка (позиция, MB/s), кривая;
+ *   - Access map      : оп -> точка (позиция на диске, лаг), позиции
+ *                       равномерно по диску - карта времени доступа по
+ *                       поверхности (зона, где сбоит позиционер или
+ *                       поверхность, приподнята);
+ *   - Seek profile    : хоп -> точка (дистанция хопа, лаг) на лог-оси X,
+ *                       дистанции log-равномерно 8K..ёмкость (профиль
+ *                       перемещения головки).
+ * Ошибки чтения (EIO) - красные крестики на позиции (Sequential, Access).
  * Обе random-вкладки - один код (rndtab), разный режим ядра.
  *
  * Поток: UI-поток (AppKit) + один рабочий поток на запуск (pthread).
@@ -86,8 +89,9 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_run = RUN_IDLE;            /* UI-поток */
 static time_t g_run_t0 = 0;             /* UI-поток */
 
-/* ---- Linear read (под g_lock, кроме помеченного) ---- */
+/* ---- Sequential read (под g_lock, кроме помеченного) ---- */
 static dbuf g_lin = { NULL, 0, 0 };
+static dbuf g_lin_errs = { NULL, 0, 0 };    /* x = позиция EIO-блока */
 static volatile int g_lin_cancel = 0;
 static int  g_lin_done = 0;
 static int  g_lin_failed = 0;
@@ -108,14 +112,15 @@ static char   g_lin_path[64] = "";      /* снимок на Старт */
 static int    g_lin_duty = 5;
 static int    g_duty = 5;
 
-/* ---- Random access / Random seek: одна структура на вкладку ---- */
+/* ---- Access map / Seek profile: одна структура на вкладку ---- */
 typedef struct {
     int          mode;          /* DGRND_ACCESS / DGRND_SEEK          */
     int          run_id;        /* RUN_ACC / RUN_SEEK                 */
-    const char  *name;          /* "Random access"                    */
+    const char  *name;          /* "Access map"                       */
 
     /* под g_lock */
     dbuf         pts;
+    dbuf         errs;          /* EIO: x = позиция (access)          */
     volatile int cancel;
     int          done, failed, oserr, elapsed;
     char         err[256];
@@ -858,6 +863,26 @@ static const char *idle_hint(void)
     return "выберите диск и нажмите Старт";
 }
 
+/* EIO: красные крестики у нижнего края на позиции ошибки */
+static int draw_eio(const plotgeo *g, const dbuf *errs)
+{
+    NSBezierPath *bp = [NSBezierPath bezierPath];
+    float y = NSMinY(g->pv) + 6.0f;
+    int   i;
+
+    for (i = 0; i < errs->n; i++) {
+        float x = geo_x(g, errs->a[i].x);
+        [bp moveToPoint:NSMakePoint(x - 4.0f, y - 4.0f)];
+        [bp lineToPoint:NSMakePoint(x + 4.0f, y + 4.0f)];
+        [bp moveToPoint:NSMakePoint(x - 4.0f, y + 4.0f)];
+        [bp lineToPoint:NSMakePoint(x + 4.0f, y - 4.0f)];
+    }
+    [bp setLineWidth:2.0f];
+    [col_spike() set];
+    [bp stroke];
+    return errs->n;
+}
+
 @interface LinView : NSView
 @end
 
@@ -866,6 +891,7 @@ static const char *idle_hint(void)
 - (void)drawRect:(NSRect)dirty
 {
     static dbuf snap = { NULL, 0, 0 };
+    static dbuf esnap = { NULL, 0, 0 };
     plotgeo g;
     double  raw = 0.0;
     int     i, running = (g_run == RUN_LIN);
@@ -875,6 +901,7 @@ static const char *idle_hint(void)
 
     pthread_mutex_lock(&g_lock);
     pts_copy(&g_lin, &snap);
+    pts_copy(&g_lin_errs, &esnap);
     g.cap  = (snap.n > 0 || running) ? g_lin_datacap : 0.0;
     bytes  = g_lin_bytes;
     us     = g_lin_time_us;
@@ -893,6 +920,12 @@ static const char *idle_hint(void)
     g.vmax = (raw > 0.0) ? axis_vmax(raw, &g.ndiv) : 0.0;
 
     draw_frame(&g, "MB/s", 1.0, "позиция на диске, GB");
+    if (esnap.n > 0) {
+        char lbl[32];
+        draw_eio(&g, &esnap);
+        snprintf(lbl, sizeof lbl, "EIO: %d", esnap.n);
+        draw_legend(&g, NSMaxX(g.pv), col_spike(), lbl, -1);
+    }
 
     if (snap.n == 0) {
         draw_hint(g.pv, running ? "открываю диск..." : idle_hint());
@@ -948,7 +981,7 @@ static const char *idle_hint(void)
 
 @end
 
-/* Random access / Random seek: scatter лаг vs дистанция */
+/* Access map: лаг vs позиция; Seek profile: лаг vs дистанция хопа */
 @interface RndView : NSView
 {
     rndtab *tab;
@@ -966,6 +999,7 @@ static const char *idle_hint(void)
 - (void)drawRect:(NSRect)dirty
 {
     static dbuf snap = { NULL, 0, 0 };
+    static dbuf esnap = { NULL, 0, 0 };
     rndtab *t = tab;
     plotgeo g;
     double  raw = 0.0, thr = 1e30;
@@ -979,6 +1013,7 @@ static const char *idle_hint(void)
 
     pthread_mutex_lock(&g_lock);
     pts_copy(&t->pts, &snap);
+    pts_copy(&t->errs, &esnap);
     g.cap = rnd_cap(t, snap.n);
     pthread_mutex_unlock(&g_lock);
     g.xlog = seek;
@@ -1002,7 +1037,7 @@ static const char *idle_hint(void)
 
     draw_frame(&g, "ms", 1000.0,
                seek ? "дистанция хопа (лог. шкала)"
-                    : "дистанция от предыдущего чтения, GB");
+                    : "позиция на диске, GB");
 
     if (snap.n == 0) {
         draw_hint(g.pv, running ? "открываю диск, прогрев..." : idle_hint());
@@ -1088,12 +1123,20 @@ static const char *idle_hint(void)
 
     {
         float right = NSMaxX(g.pv);
+        if (esnap.n > 0) {
+            char lbl[32];
+            if (!seek)
+                draw_eio(&g, &esnap);   /* у seek нет дистанции ошибки */
+            snprintf(lbl, sizeof lbl, "EIO: %d", esnap.n);
+            right = draw_legend(&g, right, col_spike(), lbl, -1);
+        }
         if (over > 0) {
             char lbl[48];
             snprintf(lbl, sizeof lbl, "выше шкалы: %d", over);
             right = draw_legend(&g, right, col_spike(), lbl, -1);
         }
-        right = draw_legend(&g, right, col_p99(), "p10 (≈ seek)", 1);
+        right = draw_legend(&g, right, col_p99(),
+                            seek ? "p10 (≈ seek)" : "p10", 1);
         right = draw_legend(&g, right, col_avg(), "медиана", 0);
         if (seek) {
             right = draw_legend(&g, right, col_dot(), "назад", -1);
@@ -1340,8 +1383,8 @@ static void status_rnd(rndtab *t)
                      "\"время перемещения головки vs дистанция\"", t->secs);
         else
             snprintf(s, sizeof s,
-                     "%d с чтений по 4 KB в случайные точки диска - время "
-                     "случайного доступа (seek + вращение)", t->secs);
+                     "%d с чтений по 4 KB в случайные точки - карта времени "
+                     "доступа по поверхности", t->secs);
         {
             char tail[160];
             sm_tail(t->sel, tail, sizeof tail);
@@ -1366,6 +1409,14 @@ static void lin_begin(void *ctx, const dglininfo *info)
     pthread_mutex_lock(&g_lock);
     g_lin_total = info->chunks;
     g_lin_datacap = (double)info->capacity;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void lin_err(void *ctx, const dglinerr *e)
+{
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    pts_add(&g_lin_errs, (double)e->off, 0.0, 0);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1396,7 +1447,7 @@ static void *lin_thread(void *arg)
     cfg.duty   = g_lin_duty;
     cfg.extent = 0;
 
-    rc = dglincore(&cfg, lin_begin, lin_seg, NULL, NULL,
+    rc = dglincore(&cfg, lin_begin, lin_seg, lin_err, NULL,
                    &g_lin_cancel, &res, err, sizeof err);
 
     pthread_mutex_lock(&g_lock);
@@ -1419,11 +1470,22 @@ static void rnd_begin(void *ctx, const dgrndinfo *info)
     pthread_mutex_unlock(&g_lock);
 }
 
+/* access: X = позиция на диске; seek: X = дистанция хопа */
 static void rnd_op(void *ctx, const dgrndop *op)
 {
     rndtab *t = (rndtab *)ctx;
+    double  x = (t->mode == DGRND_SEEK) ? (double)op->dist : (double)op->off;
+
     pthread_mutex_lock(&g_lock);
-    pts_add(&t->pts, (double)op->dist, (double)op->us, op->dir);
+    pts_add(&t->pts, x, (double)op->us, op->dir);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void rnd_err(void *ctx, const dgrnderr *e)
+{
+    rndtab *t = (rndtab *)ctx;
+    pthread_mutex_lock(&g_lock);
+    pts_add(&t->errs, (double)e->off, (double)e->us, 0);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1444,7 +1506,7 @@ static void *rnd_thread(void *arg)
     cfg.seed   = 0;                 /* из времени/pid */
     cfg.mode   = t->mode;
 
-    rc = dgrndcore(&cfg, rnd_begin, rnd_op, NULL, t,
+    rc = dgrndcore(&cfg, rnd_begin, rnd_op, rnd_err, t,
                    &t->cancel, &res, err, sizeof err);
 
     pthread_mutex_lock(&g_lock);
@@ -1499,6 +1561,7 @@ static void lin_start(void)
 
     pthread_mutex_lock(&g_lock);
     g_lin.n = 0;
+    g_lin_errs.n = 0;
     g_lin_total = 0;
     g_lin_bytes = 0;
     g_lin_time_us = 0;
@@ -1537,6 +1600,7 @@ static void rnd_start(rndtab *t)
 
     pthread_mutex_lock(&g_lock);
     t->pts.n = 0;
+    t->errs.n = 0;
     t->failed = 0;
     t->oserr = 0;
     t->err[0] = 0;
@@ -2212,9 +2276,46 @@ static const char *k_tip_dev =
     "/dev/diskN (buffered) - блочная нода: через кеш ядра порциями по "
     "4 KB, F_NOCACHE на неё не действует. Только для сравнения.";
 
+/* что даёт вкладка и как выглядит норма - серая строка под контролами */
+static const char *k_desc_seq =
+    "Скорость чтения подряд по всей поверхности: как быстро диск читает "
+    "большие файлы. Норма - плавный спад от начала к концу (внешние "
+    "дорожки быстрее); провалы - медленные или переназначенные участки.";
+static const char *k_desc_acc =
+    "Время доступа в случайные точки поверхности: как диск справляется с "
+    "мелкими разбросанными файлами. Норма - ровная полоса по всему диску "
+    "(у краёв чуть выше - это геометрия); приподнятый участок или красные "
+    "крестики - зона, где сбоят позиционер или поверхность.";
+static const char *k_desc_seek =
+    "Время прыжка головки в зависимости от его длины: механика "
+    "позиционера. Норма - плавный рост от долей ms на коротких прыжках до "
+    "полного хода; ступеньки и разрывы - проблемы механики.";
+static const char *k_desc_smart =
+    "Самодиагностика: счётчики ошибок и износа, которые диск ведёт сам. "
+    "Только чтение - тесты не запускаются, состояние диска не меняется.";
+
+#define DESC_H 30.0f                /* две строки по 11 pt */
+
+static void make_desc(NSView *v, NSSize sz, const char *txt)
+{
+    NSTextField *t = [[NSTextField alloc] initWithFrame:
+        NSMakeRect(14.0f, sz.height - 44.0f - DESC_H, sz.width - 28.0f,
+                   DESC_H)];
+    [t setStringValue:u8(txt)];
+    [t setFont:[NSFont systemFontOfSize:11.0f]];
+    [t setTextColor:[NSColor colorWithCalibratedWhite:0.40f alpha:1.0f]];
+    [t setBezeled:NO];
+    [t setEditable:NO];
+    [t setSelectable:NO];
+    [t setDrawsBackground:NO];
+    [t setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+    [v addSubview:t];
+    [t release];
+}
+
 /*
- * Вкладка: ряд контролов (диск, слайдер, Старт/Стоп), статус-строка,
- * график на остальное место. t == NULL - Linear read, иначе random.
+ * Вкладка: ряд контролов (диск, слайдер, Старт/Стоп), описание, статус,
+ * график на остальное место. t == NULL - Sequential read, иначе random.
  */
 static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
 {
@@ -2264,7 +2365,8 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
     [val setFont:[NSFont boldSystemFontOfSize:12.0f]];
 
     st = [[NSTextField alloc]
-        initWithFrame:NSMakeRect(14.0f, h - 62.0f, w - 28.0f, 17.0f)];
+        initWithFrame:NSMakeRect(14.0f, h - 66.0f - DESC_H, w - 28.0f,
+                                 17.0f)];
     [st setBezeled:NO];
     [st setEditable:NO];
     [st setSelectable:NO];
@@ -2274,7 +2376,7 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
     [st release];
 
     gv = [[(lin ? [LinView class] : [RndView class]) alloc] initWithFrame:
-        NSMakeRect(0.0f, 0.0f, w, h - 68.0f)];
+        NSMakeRect(0.0f, 0.0f, w, h - 72.0f - DESC_H)];
     [gv setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [v addSubview:gv];
     [gv release];
@@ -2287,15 +2389,19 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
                          w - 108.0f, y - 4.0f);
     tip(bstop, "Остановить прогон; уже снятые точки остаются на графике.");
 
+    make_desc(v, sz, lin ? k_desc_seq
+                         : (t->mode == DGRND_SEEK ? k_desc_seek : k_desc_acc));
+
     if (lin) {
         g_lin_dev = pop; g_lin_slider = sl; g_duty_val = val;
         g_lin_status = st; g_lin_view = gv;
         g_lin_start = bstart; g_lin_stop = bstop;
-        tip(bstart, "Linear read: сегменты по 32 MB блоками 1 MB от начала "
-                    "до конца диска. Кривая MB/s показывает зоны: снаружи "
-                    "быстрее, к центру медленнее.");
-        tip(gv, "Скорость линейного чтения (MB/s) по позиции на диске.\n"
-                "Пунктир - средняя скорость.");
+        tip(bstart, "Sequential read: сегменты по 32 MB блоками 1 MB "
+                    "равномерно от начала до конца диска. Кривая MB/s "
+                    "показывает зоны: снаружи быстрее, к центру медленнее.");
+        tip(gv, "Скорость последовательного чтения (MB/s) по позиции на "
+                "диске.\nПунктир - средняя скорость, красные крестики - "
+                "ошибки чтения (EIO).");
         fill_dev_popup(pop, g_lin_sel, sizeof g_lin_sel);
     } else {
         t->dev = pop; t->slider = sl; t->val = val;
@@ -2303,7 +2409,7 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
         t->start = bstart; t->stop = bstop;
         [(RndView *)gv setTab:t];
         if (t->mode == DGRND_SEEK) {
-            tip(bstart, "Random seek: цепочка хопов - следующее чтение 4 KB "
+            tip(bstart, "Seek profile: цепочка хопов - следующее чтение 4 KB "
                         "на +-d от предыдущего, d log-равномерно от 8 KB до "
                         "всей ёмкости. Меряет время перемещения головки в "
                         "зависимости от дистанции.");
@@ -2314,12 +2420,15 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
                     "Короткие хопы вперёд могут попасть в кеш диска "
                     "(доли ms).");
         } else {
-            tip(bstart, "Random access: чтения 4 KB в равномерно случайные "
-                        "точки всего диска. Классическое время случайного "
-                        "доступа = seek + ожидание вращения + передача.");
-            tip(gv, "Время доступа (ms) vs дистанция от предыдущего "
-                    "чтения.\nКрасные - выше p99; линии - медиана и p10 по "
-                    "дистанции.");
+            tip(bstart, "Access map: чтения 4 KB в равномерно случайные "
+                        "точки всего диска. Время доступа = seek + ожидание "
+                        "вращения + передача; медиана - классическая цифра "
+                        "random access time.");
+            tip(gv, "Время доступа (ms) по позиции на диске.\n"
+                    "Линии - медиана и p10 по полосам позиции: горб на "
+                    "них - зона, куда головка приходит хуже.\n"
+                    "Красные точки - выше p99, крестики внизу - ошибки "
+                    "чтения (EIO).");
         }
         fill_dev_popup(pop, t->sel, sizeof t->sel);
     }
@@ -2381,27 +2490,29 @@ static NSView *make_smart_tab(Controller *ctl, NSSize sz)
     [v addSubview:g_sm_dev];
     [g_sm_dev release];
 
+    make_desc(v, sz, k_desc_smart);
+
     g_sm_refresh = make_button(v, ctl, "Обновить", @selector(smRefresh:),
                                w - 108.0f, y - 4.0f);
     tip(g_sm_refresh, "Перечитать SMART всех дисков. Только чтение: "
                       "статус, атрибуты, пороги - тесты не запускаются.");
 
-    g_sm_verdict = make_text(v, NSMakeRect(14.0f, h - 86.0f, 90.0f, 32.0f),
+    g_sm_verdict = make_text(v, NSMakeRect(14.0f, h - DESC_H - 86.0f, 90.0f, 32.0f),
                              26.0f, 1);
     tip(g_sm_verdict, "OK - критичные счётчики нулевые; WARN - есть "
                       "переназначенные/нечитаемые сектора или CRC-ошибки "
                       "шлейфа; FAIL - pending-сектора или атрибут на пороге.");
-    g_sm_note = make_text(v, NSMakeRect(110.0f, h - 74.0f, w - 124.0f, 18.0f),
+    g_sm_note = make_text(v, NSMakeRect(110.0f, h - DESC_H - 74.0f, w - 124.0f, 18.0f),
                           13.0f, 1);
-    g_sm_ident = make_text(v, NSMakeRect(110.0f, h - 92.0f, w - 124.0f, 17.0f),
+    g_sm_ident = make_text(v, NSMakeRect(110.0f, h - DESC_H - 92.0f, w - 124.0f, 17.0f),
                            11.0f, 0);
-    g_sm_explain = make_text(v, NSMakeRect(14.0f, h - 132.0f, w - 28.0f,
+    g_sm_explain = make_text(v, NSMakeRect(14.0f, h - DESC_H - 132.0f, w - 28.0f,
                                            34.0f), 11.0f, 0);
     [g_sm_explain setTextColor:
         [NSColor colorWithCalibratedWhite:0.25f alpha:1.0f]];
 
     sv = [[NSScrollView alloc] initWithFrame:
-        NSMakeRect(8.0f, 8.0f, w - 16.0f, h - 146.0f)];
+        NSMakeRect(8.0f, 8.0f, w - 16.0f, h - 146.0f - DESC_H)];
     [sv setHasVerticalScroller:YES];
     if ([sv respondsToSelector:@selector(setAutohidesScrollers:)])
         [sv setAutohidesScrollers:YES];         /* 10.3+ */
@@ -2569,8 +2680,8 @@ int main(int argc, char *argv[])
     }
     g_is_root = (geteuid() == 0) ? 1 : 0;
 
-    rndtab_init(&g_acc,  DGRND_ACCESS, RUN_ACC,  "Random access", 30);
-    rndtab_init(&g_seek, DGRND_SEEK,   RUN_SEEK, "Random seek",   30);
+    rndtab_init(&g_acc,  DGRND_ACCESS, RUN_ACC,  "Access map",   30);
+    rndtab_init(&g_seek, DGRND_SEEK,   RUN_SEEK, "Seek profile", 30);
 
     /* dev-хук: -w N -h N задают стартовый размер (проверка раскладки) */
     for (i = 1; i + 1 < argc; i++) {
@@ -2637,9 +2748,9 @@ int main(int argc, char *argv[])
     [root addSubview:g_tabs];
 
     csz = [g_tabs contentRect].size;
-    add_tab(ctl, csz, NULL,    "Linear read");
-    add_tab(ctl, csz, &g_acc,  "Random access");
-    add_tab(ctl, csz, &g_seek, "Random seek");
+    add_tab(ctl, csz, NULL,    "Sequential read");
+    add_tab(ctl, csz, &g_acc,  "Access map");
+    add_tab(ctl, csz, &g_seek, "Seek profile");
     g_sm_tab = [[NSTabViewItem alloc] initWithIdentifier:nil];
     [g_sm_tab setLabel:[NSString stringWithUTF8String:"SMART"]];
     [g_sm_tab setView:make_smart_tab(ctl, csz)];
