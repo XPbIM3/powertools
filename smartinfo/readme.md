@@ -123,6 +123,23 @@ disk0  FUJITSU MHV2080BH          00000025   74.5G  OK           0     0    0   
 - `RAW` вендор-специфичен: сравнивать между собой можно только счётчики
   `197/198/199` и `5`, остальные числа имеют смысл лишь в динамике.
 
+## Ядро smartcore
+
+Сам SMART-зонд вынесен в `smartcore.c/.h` (как `dglincore` у diskgraph):
+детект, IDENTIFY, ретраи, разбор атрибутов и вердикт. `smartinfo.c` -
+консольная обёртка: таблица, `-a`, коды возврата; вывод байт-в-байт
+прежний (сверено diff'ом на quicksilver). То же ядро зовёт вкладка
+SMART в `DiskGraph.app` (`../smartinfo/smartcore.c`).
+
+- `smartcore.h` - чистый C без IOKit-типов: `sm_disk` (паспорт, вердикт,
+  разобранные атрибуты), `sm_attr` с полем `level` (OK/WARN/FAIL по тем
+  же правилам, что вердикт - UI подсвечивает виновные строки)
+- API: `sm_scan()`, `sm_probe()`, `sm_attr_name()`, `sm_verdict_str()`
+- сырые 512-байтные структуры SMART живут только внутри `sm_probe`
+- `kIOPropertyProductSerialNumberKey` нет в заголовках Tiger
+  (`/usr/include` 10.4, нативная сборка на G4) - в ядре fallback-define
+  `"Serial Number"`, ключ реестра одинаков во всех версиях
+
 ## Сборка
 
 ```

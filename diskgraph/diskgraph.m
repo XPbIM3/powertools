@@ -1,6 +1,8 @@
 /*
- * diskgraph.m - UI DiskGraph: три вкладки (Linear read / Random access /
- *               Random seek) на РЕАЛЬНЫХ замерах через dglincore/dgrndcore
+ * diskgraph.m - UI DiskGraph: вкладки Linear read / Random access /
+ *               Random seek на РЕАЛЬНЫХ замерах через dglincore/dgrndcore
+ *               + вкладка SMART на ядре ../smartinfo/smartcore (только
+ *               чтение: статус, атрибуты, пороги)
  *
  * Фронт и бэк скрещены: вкладки зовут те же ядра, что и консольные
  * dblin/dbrnd, но данные приходят не в stdout, а в sink-калбеки:
@@ -45,6 +47,7 @@
 #include "dglincore.h"
 #include "dgrndcore.h"
 #include "dgdev.h"
+#include "smartcore.h"
 
 /* ---- параметры приборов (как в консольных тулзах) ---- */
 #define LIN_SEG (32ULL << 20)      /* 32 MiB чанк  */
@@ -480,6 +483,27 @@ static int fill_dev_popup(NSPopUpButton *pop, char *sel, size_t selsz)
 }
 
 /* ------------------------------------------------------- шрифты/текст */
+
+/*
+ * C-строка -> NSString без nil: если snprintf/strncat обрезали русский
+ * текст посреди UTF-8-последовательности, хвост отбрасывается (nil в
+ * setStringValue: на старых AppKit - исключение).
+ */
+static NSString *u8(const char *s)
+{
+    NSString *r = [NSString stringWithUTF8String:s];
+    char      b[1024];
+    size_t    n;
+
+    if (r != nil)
+        return r;
+    snprintf(b, sizeof b, "%s", s);
+    n = strlen(b);
+    while (n > 0 && ((unsigned char)b[n - 1] & 0x80))
+        b[--n] = 0;                 /* до последнего ASCII-байта */
+    r = [NSString stringWithUTF8String:b];
+    return r != nil ? r : @"";
+}
 
 static NSColor *rgb(float r, float g, float b, float a)
 {
@@ -1088,7 +1112,7 @@ static void set_status(NSTextField *f, const char *s, int kind)
 {
     if (f == NULL)
         return;
-    [f setStringValue:[NSString stringWithUTF8String:s]];
+    [f setStringValue:u8(s)];
     [f setFont:(kind == ST_DONE) ? [NSFont boldSystemFontOfSize:11.0f]
                                  : [NSFont systemFontOfSize:11.0f]];
     [f setTextColor:(kind == ST_ERROR) ? rgb(0.75f, 0.10f, 0.08f, 1.0f)
@@ -1107,6 +1131,68 @@ static void err_text(char *s, size_t sz, int oserr, const char *err)
 static const char *k_noroot =
     "Нет прав на raw-диск - перезапустите приложение и введите пароль "
     "администратора";
+
+/* ------------------------------------------------------------ SMART */
+
+/*
+ * SMART всех целых дисков читает фоновый поток (ядро smartcore, ретраи
+ * спящего диска до ~3 с - UI не замирает). Результат - массив под
+ * g_lock + номер поколения; тик видит новое поколение и копирует его
+ * в g_sm_ui (UI-поток), откуда читают вкладка SMART и статусы.
+ */
+#define SM_MAX 16
+
+static sm_disk g_sm_res[SM_MAX];        /* под g_lock */
+static int     g_sm_res_n = 0;
+static int     g_sm_gen = 0;            /* +1 на каждый завершённый опрос */
+static int     g_sm_busy = 0;           /* UI-поток: опрос идёт */
+
+static sm_disk g_sm_ui[SM_MAX];         /* UI-поток */
+static int     g_sm_ui_n = 0;
+static int     g_sm_ui_gen = 0;
+static char    g_sm_sel[16] = "disk0";
+
+static NSPopUpButton *g_sm_dev = NULL;
+static NSButton      *g_sm_refresh = NULL;
+static NSTextField   *g_sm_verdict = NULL;
+static NSTextField   *g_sm_note = NULL;
+static NSTextField   *g_sm_ident = NULL;
+static NSTextField   *g_sm_explain = NULL;
+static NSTableView   *g_sm_table = NULL;
+static NSTabViewItem *g_sm_tab = NULL;
+
+static const sm_disk *sm_find(const char *name)
+{
+    int i;
+    for (i = 0; i < g_sm_ui_n; i++)
+        if (strcmp(g_sm_ui[i].name, name) == 0)
+            return &g_sm_ui[i];
+    return NULL;
+}
+
+/* "/dev/rdisk1" и "/dev/disk1" -> "disk1" */
+static void dev_to_disk(const char *path, char *out, size_t outsz)
+{
+    const char *p = strrchr(path, '/');
+    p = (p != NULL) ? p + 1 : path;
+    if (p[0] == 'r')
+        p++;
+    snprintf(out, outsz, "%s", p);
+}
+
+/* хвост статуса замера: "   ·   SMART: WARN (...)" для плохого диска */
+static void sm_tail(const char *path, char *out, size_t outsz)
+{
+    char           nm[16];
+    const sm_disk *d;
+
+    out[0] = 0;
+    dev_to_disk(path, nm, sizeof nm);
+    d = sm_find(nm);
+    if (d != NULL && (d->vd == VD_WARN || d->vd == VD_FAIL))
+        snprintf(out, outsz, "   ·   SMART: %s (%s)",
+                 sm_verdict_str(d->vd), d->note);
+}
 
 static void status_lin(void)
 {
@@ -1168,6 +1254,11 @@ static void status_lin(void)
                      g_lin_selcap / GIB, g_duty);
         else
             snprintf(s, sizeof s, "Выберите диск и нажмите Старт");
+        {
+            char tail[160];
+            sm_tail(g_lin_sel, tail, sizeof tail);
+            strncat(s, tail, sizeof s - strlen(s) - 1);
+        }
         set_status(g_lin_status, s, ST_NORMAL);
     }
 }
@@ -1251,6 +1342,11 @@ static void status_rnd(rndtab *t)
             snprintf(s, sizeof s,
                      "%d с чтений по 4 KB в случайные точки диска - время "
                      "случайного доступа (seek + вращение)", t->secs);
+        {
+            char tail[160];
+            sm_tail(t->sel, tail, sizeof tail);
+            strncat(s, tail, sizeof s - strlen(s) - 1);
+        }
         set_status(t->status, s, ST_NORMAL);
     }
 }
@@ -1511,6 +1607,229 @@ static rndtab *rndtab_of(id ctl)
     return NULL;
 }
 
+/* ------------------------------------------------------- SMART: опрос */
+
+static void *sm_thread(void *arg)
+{
+    static sm_disk tmp[SM_MAX];        /* один поток за раз (g_sm_busy) */
+    char names[SM_MAX][16];
+    int  n, i;
+
+    (void)arg;
+    n = sm_scan(names, SM_MAX);
+    for (i = 0; i < n; i++)
+        sm_probe(names[i], &tmp[i]);
+
+    pthread_mutex_lock(&g_lock);
+    memcpy(g_sm_res, tmp, (size_t)n * sizeof(sm_disk));
+    g_sm_res_n = n;
+    g_sm_gen++;
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+static void sm_refresh(void)
+{
+    if (g_sm_busy)
+        return;
+    g_sm_busy = 1;
+    if (!start_thread(sm_thread, NULL)) {
+        g_sm_busy = 0;
+        return;
+    }
+    [g_sm_refresh setEnabled:NO];
+    [g_sm_verdict setStringValue:[NSString stringWithUTF8String:"..."]];
+    [g_sm_note setStringValue:[NSString stringWithUTF8String:
+                                  "читаю SMART..."]];
+}
+
+/* короткое пояснение атрибута для колонки "Что это" */
+static const char *sm_explain(int id)
+{
+    switch (id) {
+    case 1:   return "ошибки чтения; у Seagate RAW велик - норма";
+    case 3:   return "время раскрутки шпинделя";
+    case 4:   return "число пусков/остановок шпинделя";
+    case 5:   return "переназначенные сектора: > 0 - поверхность сыпется";
+    case 7:   return "ошибки позиционирования; у Seagate RAW велик - норма";
+    case 9:   return "наработка, часы";
+    case 10:  return "повторы раскрутки - механика или питание";
+    case 12:  return "число включений";
+    case 184: return "ошибки тракта данных внутри диска";
+    case 187: return "неисправимые ошибки, о которых диск сообщил";
+    case 188: return "таймауты команд";
+    case 189: return "запись при высоком полёте головки";
+    case 190:
+    case 194: return "температура, °C";
+    case 191: return "удары (датчик ускорения)";
+    case 192: return "аварийные парковки при пропадании питания";
+    case 193: return "парковки головок (ноутбуки: ресурс ~300-600 тыс.)";
+    case 195: return "аппаратная ECC-коррекция (Seagate)";
+    case 196: return "события переназначения";
+    case 197: return "нестабильные сектора: данные под угрозой";
+    case 198: return "нечитаемые сектора по фоновому скану";
+    case 199: return "CRC-ошибки шлейфа/контроллера, не поверхность";
+    case 200: return "ошибки записи";
+    default:  return "";
+    }
+}
+
+/* человеческое пояснение к вердикту: по каждой находке строка */
+static void sm_findings(const sm_disk *d, char *out, size_t outsz)
+{
+    int i;
+
+    out[0] = 0;
+    if (!d->have_data) {
+        if (d->need_root)
+            snprintf(out, outsz, "SMART читается только с правами "
+                                 "администратора.");
+        else
+            snprintf(out, outsz, "Данных SMART нет: %s. USB/FireWire-"
+                     "мосты и RAID-тома SMART не пропускают.", d->note);
+        return;
+    }
+    if (d->exceeded)
+        snprintf(out + strlen(out), outsz - strlen(out),
+                 "Диск сам сообщает о превышении порога (SMART status: "
+                 "FAIL) - готовьтесь к замене.  ");
+    for (i = 0; i < d->nattr; i++) {
+        const sm_attr *a = &d->attrs[i];
+        unsigned long  v = (unsigned long)(a->raw & 0xffffffffULL);
+        char           b[512];
+
+        if (a->level == SM_LV_OK)
+            continue;
+        b[0] = 0;
+        if (a->id == 197)
+            snprintf(b, sizeof b, "Pending = %lu: диск не смог прочитать "
+                     "%lu сектор(ов), данные в них под угрозой - сделайте "
+                     "копию.  ", v, v);
+        else if (a->id == 5)
+            snprintf(b, sizeof b, "Reallocated = %lu: диск уже подменил "
+                     "%lu сектор(ов) резервными - поверхность деградирует, "
+                     "следите за ростом.  ", v, v);
+        else if (a->id == 198)
+            snprintf(b, sizeof b, "Offline Uncorrectable = %lu: фоновый "
+                     "скан нашёл нечитаемые сектора.  ", v);
+        else if (a->id == 199)
+            snprintf(b, sizeof b, "UDMA CRC = %lu: ошибки передачи по "
+                     "шлейфу/контроллеру, а не поверхности. Проверьте "
+                     "80-жильный кабель и разъёмы.  ", v);
+        else if (a->level == SM_LV_FAIL)
+            snprintf(b, sizeof b, "Атрибут %d (%s) дошёл до порога "
+                     "(%d <= %d) - диск прогнозирует отказ.  ",
+                     a->id, sm_attr_name(a->id) ? sm_attr_name(a->id) : "?",
+                     a->value, a->thr);
+        strncat(out, b, outsz - strlen(out) - 1);
+    }
+    if (out[0] == 0)
+        snprintf(out, outsz, "Критичные счётчики (5, 197, 198, 199) "
+                 "нулевые, пороги не достигнуты.");
+}
+
+/* заголовок пункта popup: "disk0 - ST360021A, 55.9 GB" */
+static NSString *sm_title(const sm_disk *d)
+{
+    char t[96];
+    if (d->model[0])
+        snprintf(t, sizeof t, "%s - %s, %.1f GB", d->name, d->model,
+                 (double)d->bytes / GIB);
+    else
+        snprintf(t, sizeof t, "%s", d->name);
+    return [NSString stringWithUTF8String:t];
+}
+
+/* UI-поток: показать выбранный диск (плашка, паспорт, таблица) */
+static void sm_show(void)
+{
+    const sm_disk *d = sm_find(g_sm_sel);
+    char  s[1024];
+    NSColor *c;
+
+    if (g_sm_verdict == nil)
+        return;
+    [g_sm_table reloadData];
+    if (d == NULL) {
+        [g_sm_verdict setStringValue:[NSString stringWithUTF8String:"-"]];
+        [g_sm_note setStringValue:@""];
+        [g_sm_ident setStringValue:@""];
+        [g_sm_explain setStringValue:@""];
+        return;
+    }
+
+    switch (d->vd) {
+    case VD_OK:   c = col_avg(); break;
+    case VD_WARN: c = col_p99(); break;
+    case VD_FAIL: c = col_spike(); break;
+    default:      c = [NSColor grayColor]; break;
+    }
+    [g_sm_verdict setTextColor:c];
+    [g_sm_verdict setStringValue:
+        [NSString stringWithUTF8String:sm_verdict_str(d->vd)]];
+    [g_sm_note setStringValue:[NSString stringWithUTF8String:
+        d->note[0] ? d->note : (d->vd == VD_OK ? "всё в порядке" : "")]];
+
+    {
+        char h[64] = "", t[24] = "";
+        if (d->has_hours)
+            snprintf(h, sizeof h, "   ·   %llu ч (%.1f лет)",
+                     (unsigned long long)d->n_hours,
+                     (double)d->n_hours / 8766.0);
+        if (d->temp >= 0)
+            snprintf(t, sizeof t, "   ·   %d °C", d->temp);
+        snprintf(s, sizeof s, "%s   ·   S/N %s   ·   FW %s   ·   %s   ·   "
+                 "%.1f GB%s%s",
+                 d->model[0] ? d->model : "-",
+                 d->serial[0] ? d->serial : "-",
+                 d->fw[0] ? d->fw : "-",
+                 d->bus[0] ? d->bus : "-",
+                 (double)d->bytes / GIB, h, t);
+        [g_sm_ident setStringValue:u8(s)];
+    }
+    sm_findings(d, s, sizeof s);
+    [g_sm_explain setStringValue:u8(s)];
+}
+
+/* UI-поток: тик - забрать новое поколение опроса */
+static void sm_poll(void)
+{
+    int gen, i, bad = 0;
+
+    pthread_mutex_lock(&g_lock);
+    gen = g_sm_gen;
+    if (gen != g_sm_ui_gen) {
+        memcpy(g_sm_ui, g_sm_res, (size_t)g_sm_res_n * sizeof(sm_disk));
+        g_sm_ui_n = g_sm_res_n;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if (gen == g_sm_ui_gen)
+        return;
+    g_sm_ui_gen = gen;
+    g_sm_busy = 0;
+    [g_sm_refresh setEnabled:YES];
+
+    /* popup: имена + модели; выбор сохраняется */
+    [g_sm_dev removeAllItems];
+    for (i = 0; i < g_sm_ui_n; i++) {
+        [g_sm_dev addItemWithTitle:sm_title(&g_sm_ui[i])];
+        if (strcmp(g_sm_ui[i].name, g_sm_sel) == 0)
+            [g_sm_dev selectItemAtIndex:i];
+        if (g_sm_ui[i].vd == VD_WARN || g_sm_ui[i].vd == VD_FAIL)
+            bad = 1;
+    }
+    if (g_sm_ui_n > 0 && sm_find(g_sm_sel) == NULL) {
+        snprintf(g_sm_sel, sizeof g_sm_sel, "%s", g_sm_ui[0].name);
+        [g_sm_dev selectItemAtIndex:0];
+    }
+
+    /* "лампочка" на ярлыке вкладки */
+    [g_sm_tab setLabel:[NSString stringWithUTF8String:
+                           bad ? "SMART (!)" : "SMART"]];
+    [g_tabs setNeedsDisplay:YES];
+    sm_show();
+}
+
 /* ------------------------------------------------------------ контроллер */
 
 @interface Controller : NSObject
@@ -1523,6 +1842,8 @@ static rndtab *rndtab_of(id ctl)
 - (void)devChanged:(id)s;
 - (void)appActive:(NSNotification *)n;
 - (void)windowDidResize:(NSNotification *)n;
+- (void)smRefresh:(id)s;
+- (void)smDevChanged:(id)s;
 - (void)tick:(NSTimer *)timer;
 - (void)quit:(id)s;
 @end
@@ -1636,6 +1957,86 @@ static rndtab *rndtab_of(id ctl)
     refresh_devs();
 }
 
+- (void)smRefresh:(id)s
+{
+    (void)s;
+    sm_refresh();
+}
+
+- (void)smDevChanged:(id)s
+{
+    int i = (int)[s indexOfSelectedItem];
+    if (i >= 0 && i < g_sm_ui_n) {
+        snprintf(g_sm_sel, sizeof g_sm_sel, "%s", g_sm_ui[i].name);
+        sm_show();
+    }
+}
+
+/* таблица SMART: data source / delegate (API 10.0) */
+- (int)numberOfRowsInTableView:(NSTableView *)tv
+{
+    const sm_disk *d = sm_find(g_sm_sel);
+    (void)tv;
+    return (d != NULL && d->have_data) ? d->nattr : 0;
+}
+
+- (id)tableView:(NSTableView *)tv objectValueForTableColumn:(NSTableColumn *)col
+            row:(int)row
+{
+    const sm_disk *d = sm_find(g_sm_sel);
+    const sm_attr *a;
+    NSString      *cid = [col identifier];
+    char           b[256];
+
+    (void)tv;
+    if (d == NULL || row < 0 || row >= d->nattr)
+        return @"";
+    a = &d->attrs[row];
+    b[0] = 0;
+    if ([cid isEqualToString:@"id"])
+        snprintf(b, sizeof b, "%d", a->id);
+    else if ([cid isEqualToString:@"name"])
+        snprintf(b, sizeof b, "%s", sm_attr_name(a->id) ?
+                 sm_attr_name(a->id) : "Vendor_Specific");
+    else if ([cid isEqualToString:@"val"])
+        snprintf(b, sizeof b, "%d", a->value);
+    else if ([cid isEqualToString:@"wor"])
+        snprintf(b, sizeof b, "%d", a->worst);
+    else if ([cid isEqualToString:@"thr"])
+        snprintf(b, sizeof b, a->has_thr ? "%d" : "?", a->thr);
+    else if ([cid isEqualToString:@"raw"])
+        snprintf(b, sizeof b, "%lu", (unsigned long)(a->raw & 0xffffffffULL));
+    else if ([cid isEqualToString:@"type"])
+        snprintf(b, sizeof b, "%s", (a->flags & 1) ? "pre-fail" : "old-age");
+    else if ([cid isEqualToString:@"what"])
+        snprintf(b, sizeof b, "%s", sm_explain(a->id));
+    return u8(b);
+}
+
+- (void)tableView:(NSTableView *)tv willDisplayCell:(id)cell
+   forTableColumn:(NSTableColumn *)col row:(int)row
+{
+    const sm_disk *d = sm_find(g_sm_sel);
+    int            lv = SM_LV_OK;
+
+    (void)tv;
+    (void)col;
+    if (d != NULL && row >= 0 && row < d->nattr)
+        lv = d->attrs[row].level;
+    if (![cell respondsToSelector:@selector(setDrawsBackground:)])
+        return;
+    if (lv == SM_LV_OK) {
+        [cell setDrawsBackground:NO];
+        [cell setTextColor:[NSColor controlTextColor]];
+    } else {
+        [cell setDrawsBackground:YES];
+        [cell setBackgroundColor:(lv == SM_LV_FAIL)
+            ? rgb(1.0f, 0.82f, 0.80f, 1.0f) : rgb(1.0f, 0.90f, 0.72f, 1.0f)];
+        [cell setTextColor:(lv == SM_LV_FAIL)
+            ? rgb(0.60f, 0.0f, 0.0f, 1.0f) : rgb(0.45f, 0.22f, 0.0f, 1.0f)];
+    }
+}
+
 /* view вкладок сами не тянутся за NSTabView - выставляем contentRect */
 - (void)windowDidResize:(NSNotification *)n
 {
@@ -1651,6 +2052,7 @@ static rndtab *rndtab_of(id ctl)
         if (v != nil)
             [v setFrame:cr];
     }
+    [g_sm_table sizeLastColumnToFit];
 }
 
 - (void)tick:(NSTimer *)timer
@@ -1670,6 +2072,7 @@ static rndtab *rndtab_of(id ctl)
 
     rnd_stats_update(&g_acc);
     rnd_stats_update(&g_seek);
+    sm_poll();
 
     if (g_run != RUN_IDLE && done) {
         int was = g_run;
@@ -1923,6 +2326,115 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
     return [v autorelease];
 }
 
+static NSTextField *make_text(NSView *v, NSRect r, float size, int bold)
+{
+    NSTextField *t = [[NSTextField alloc] initWithFrame:r];
+    [t setStringValue:@""];
+    [t setFont:bold ? [NSFont boldSystemFontOfSize:size]
+                    : [NSFont systemFontOfSize:size]];
+    [t setBezeled:NO];
+    [t setEditable:NO];
+    [t setSelectable:NO];
+    [t setDrawsBackground:NO];
+    [t setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+    [v addSubview:t];
+    return [t autorelease];
+}
+
+static void sm_column(NSTableView *tv, NSString *ident, const char *title,
+                      float w, int right)
+{
+    NSTableColumn *c = [[NSTableColumn alloc] initWithIdentifier:ident];
+    [[c headerCell] setStringValue:[NSString stringWithUTF8String:title]];
+    [c setWidth:w];
+    [c setMinWidth:24.0f];
+    [c setEditable:NO];
+    [[c dataCell] setFont:[NSFont systemFontOfSize:11.0f]];
+    if (right)
+        [[c dataCell] setAlignment:NSRightTextAlignment];
+    [tv addTableColumn:c];
+    [c release];
+}
+
+/*
+ * Вкладка SMART: диск + "Обновить", плашка вердикта, паспорт,
+ * пояснение находок, таблица атрибутов. Только чтение SMART.
+ */
+static NSView *make_smart_tab(Controller *ctl, NSSize sz)
+{
+    NSView       *v = [[NSView alloc] initWithFrame:
+                           NSMakeRect(0.0f, 0.0f, sz.width, sz.height)];
+    float         h = sz.height, w = sz.width;
+    float         y = h - 36.0f;
+    NSScrollView *sv;
+    NSTableView  *tv;
+
+    make_label(v, "Диск:", 10.0f, y + 4.0f, 40.0f, 1);
+    g_sm_dev = [[NSPopUpButton alloc]
+        initWithFrame:NSMakeRect(54.0f, y - 1.0f, 300.0f, 26.0f) pullsDown:NO];
+    [g_sm_dev setTarget:ctl];
+    [g_sm_dev setAction:@selector(smDevChanged:)];
+    [g_sm_dev setAutoresizingMask:NSViewMinYMargin];
+    [g_sm_dev addItemWithTitle:[NSString stringWithUTF8String:g_sm_sel]];
+    tip(g_sm_dev, "Целые диски. SMART отдают внутренние ATA/SATA-диски; "
+                  "USB/FireWire-мосты и RAID-тома - нет.");
+    [v addSubview:g_sm_dev];
+    [g_sm_dev release];
+
+    g_sm_refresh = make_button(v, ctl, "Обновить", @selector(smRefresh:),
+                               w - 108.0f, y - 4.0f);
+    tip(g_sm_refresh, "Перечитать SMART всех дисков. Только чтение: "
+                      "статус, атрибуты, пороги - тесты не запускаются.");
+
+    g_sm_verdict = make_text(v, NSMakeRect(14.0f, h - 86.0f, 90.0f, 32.0f),
+                             26.0f, 1);
+    tip(g_sm_verdict, "OK - критичные счётчики нулевые; WARN - есть "
+                      "переназначенные/нечитаемые сектора или CRC-ошибки "
+                      "шлейфа; FAIL - pending-сектора или атрибут на пороге.");
+    g_sm_note = make_text(v, NSMakeRect(110.0f, h - 74.0f, w - 124.0f, 18.0f),
+                          13.0f, 1);
+    g_sm_ident = make_text(v, NSMakeRect(110.0f, h - 92.0f, w - 124.0f, 17.0f),
+                           11.0f, 0);
+    g_sm_explain = make_text(v, NSMakeRect(14.0f, h - 132.0f, w - 28.0f,
+                                           34.0f), 11.0f, 0);
+    [g_sm_explain setTextColor:
+        [NSColor colorWithCalibratedWhite:0.25f alpha:1.0f]];
+
+    sv = [[NSScrollView alloc] initWithFrame:
+        NSMakeRect(8.0f, 8.0f, w - 16.0f, h - 146.0f)];
+    [sv setHasVerticalScroller:YES];
+    if ([sv respondsToSelector:@selector(setAutohidesScrollers:)])
+        [sv setAutohidesScrollers:YES];         /* 10.3+ */
+    [sv setBorderType:NSBezelBorder];
+    [sv setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+    tv = [[NSTableView alloc] initWithFrame:[[sv contentView] bounds]];
+    sm_column(tv, @"id",   "ID",       34.0f, 1);
+    sm_column(tv, @"name", "Атрибут", 170.0f, 0);
+    sm_column(tv, @"val",  "Value",    46.0f, 1);
+    sm_column(tv, @"wor",  "Worst",    46.0f, 1);
+    sm_column(tv, @"thr",  "Thr",      38.0f, 1);
+    sm_column(tv, @"raw",  "Raw",      84.0f, 1);
+    sm_column(tv, @"type", "Тип",      64.0f, 0);
+    sm_column(tv, @"what", "Что это", 300.0f, 0);
+    [tv setDataSource:ctl];
+    [tv setDelegate:ctl];
+    [tv setAllowsColumnReordering:NO];
+    [tv setAutoresizingMask:NSViewWidthSizable];
+    [tv setRowHeight:16.0f];
+    tip(tv, "Value/Worst - нормированные вендором значения (больше - "
+            "лучше), Thr - порог; Raw - сырой счётчик (младшие 32 бита). "
+            "Подсвечены строки, из-за которых вердикт WARN/FAIL.");
+    [sv setDocumentView:tv];
+    [tv sizeLastColumnToFit];
+    g_sm_table = tv;
+    [tv release];
+    [v addSubview:sv];
+    [sv release];
+
+    return [v autorelease];
+}
+
 /* ------------------------------------------------------- подъём прав */
 
 /*
@@ -2128,6 +2640,10 @@ int main(int argc, char *argv[])
     add_tab(ctl, csz, NULL,    "Linear read");
     add_tab(ctl, csz, &g_acc,  "Random access");
     add_tab(ctl, csz, &g_seek, "Random seek");
+    g_sm_tab = [[NSTabViewItem alloc] initWithIdentifier:nil];
+    [g_sm_tab setLabel:[NSString stringWithUTF8String:"SMART"]];
+    [g_sm_tab setView:make_smart_tab(ctl, csz)];
+    [g_tabs addTabViewItem:g_sm_tab];
     [ctl windowDidResize:nil];
 
     g_lin_selcap  = dg_probe_capacity(g_lin_sel);
@@ -2135,6 +2651,7 @@ int main(int argc, char *argv[])
     g_seek.selcap = dg_probe_capacity(g_seek.sel);
     update_controls();
     status_all();
+    sm_refresh();                   /* SMART всех дисков - фоном */
 
     /* dev-хуки: -ldev/-adev/-sdev PATH - диск вкладки; -lin/-acc/-seek
      * стартуют реальный прогон; -cycle щёлкает вкладки и печатает
@@ -2147,6 +2664,8 @@ int main(int argc, char *argv[])
             lin_sel_changed();
         } else if (strcmp(argv[i], "-adev") == 0) {
             t = &g_acc;
+        } else if (strcmp(argv[i], "-smdev") == 0) {
+            snprintf(g_sm_sel, sizeof g_sm_sel, "%s", argv[i + 1]);
         } else if (strcmp(argv[i], "-sdev") == 0) {
             t = &g_seek;
         }
@@ -2166,6 +2685,8 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "-seek") == 0) {
             [g_tabs selectTabViewItemAtIndex:2];
             rnd_start(&g_seek);
+        } else if (strcmp(argv[i], "-smart") == 0) {
+            [g_tabs selectTabViewItemAtIndex:3];
         } else if (strcmp(argv[i], "-tab") == 0 && i + 1 < argc) {
             [g_tabs selectTabViewItemAtIndex:atoi(argv[i + 1])];
             i++;

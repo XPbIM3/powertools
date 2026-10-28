@@ -42,9 +42,15 @@ $(APP): $(PROBE).m Info.plist
 
 # ступень 4b: UI зовёт ядра dglincore/dgrndcore напрямую (pthread),
 # без внешних процессов и stdout-обмена
+# SMART-вкладка зовёт ядро соседнего smartinfo (тот же код, что у CLI)
+SMARTDIR    = ../smartinfo
+
 $(APP2): diskgraph.m dglincore.c dgrndcore.c dglincore.h dgrndcore.h \
-         dgdev.c dgdev.h Info-diskgraph.plist
-	$(CC) $(APPFLAGS) diskgraph.m -x none dglincore.c dgrndcore.c dgdev.c \
+         dgdev.c dgdev.h $(SMARTDIR)/smartcore.c $(SMARTDIR)/smartcore.h \
+         Info-diskgraph.plist
+	$(CC) $(APPFLAGS) -I$(SMARTDIR) -framework CoreFoundation \
+	      diskgraph.m -x none dglincore.c dgrndcore.c dgdev.c \
+	      $(SMARTDIR)/smartcore.c \
 	      -lpthread -o diskgraph
 	@mkdir -p $(APP2)/Contents/MacOS $(APP2)/Contents/Resources
 	@cp Info-diskgraph.plist $(APP2)/Contents/Info.plist

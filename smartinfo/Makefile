@@ -14,15 +14,19 @@ TARGET  = smartinfo
 
 all: $(TARGET)
 
-$(TARGET): smartinfo.c
-	$(CC) $(CFLAGS) $(TARGET_FLAGS) $(FRAMEWORKS) -o $(TARGET) smartinfo.c
+# smartcore - сам SMART-зонд (его же зовёт DiskGraph.app), smartinfo.c -
+# консольная обёртка: таблица, -a, коды возврата
+SRCS    = smartinfo.c smartcore.c
+
+$(TARGET): $(SRCS) smartcore.h
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) $(FRAMEWORKS) -o $(TARGET) $(SRCS)
 
 # Intel-сборка отдельная, не universal: своя цель, чтобы ppc-бинарь
 # не тянул minos 10.4 и оставался годным для Jaguar/Panther.
 intel: smartinfo-i386
 
-smartinfo-i386: smartinfo.c
-	$(CC) $(CFLAGS) -arch i386 -mmacosx-version-min=10.4 $(FRAMEWORKS) -o smartinfo-i386 smartinfo.c
+smartinfo-i386: $(SRCS) smartcore.h
+	$(CC) $(CFLAGS) -arch i386 -mmacosx-version-min=10.4 $(FRAMEWORKS) -o smartinfo-i386 $(SRCS)
 
 clean:
 	rm -f $(TARGET) smartinfo-i386
