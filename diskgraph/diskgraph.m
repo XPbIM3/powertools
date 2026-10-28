@@ -15,8 +15,14 @@
  *   - у осей есть подписи: X - "поверхность диска, GB", Y - "MB/s"/"ms";
  *   - Y-шкала подгоняется под данные (круглые деления, без пустого верха);
  *   - вкладка тянется вместе с окном, график не вылезает за контент;
- *   - селектор устройства (/dev/rdiskN) есть на каждой вкладке; на этом
- *     этапе он только выбор, реального чтения нет.
+ *   - селектор устройства на каждой вкладке: /dev/rdiskN (raw) и
+ *     /dev/diskN (buffered) - парами, чтобы сравнивать; на этом этапе
+ *     выбор чисто визуальный, реального чтения нет.
+ *
+ * Dev-хуки (для скриншотов и проверок): -lin / -rnd автостарт мока,
+ * -cycle сам щёлкает вкладки и печатает счётчики точек (проверка, что
+ * данные не теряются), -devs печатает список дисков и выходит,
+ * -w N -h N задают стартовый размер окна.
  *
  * Стык для будущего движка: мок-слой гадит данные через те же
  * pts_add/массивы, что потом будет наполнять sink настоящего ядра
@@ -32,6 +38,7 @@
 #import <AppKit/AppKit.h>
 #include <dirent.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <math.h>
 
 /* ---- мок-геометрия: реальный disk0 quicksilver-g4-867 ---- */
@@ -68,6 +75,10 @@ static double g_lin_skip = 0.0;
 
 static int    g_rnd_on = 0;
 static double g_rnd_elapsed = 0.0;
+
+/* dev-хук -cycle: сам щёлкает вкладки и печатает счётчики точек */
+static int    g_cycle = 0;
+static int    g_cycle_ticks = 0;
 
 /* UI-хвосты */
 static NSTextField   *g_lin_status = NULL;
@@ -138,24 +149,32 @@ static int intcmp(const void *a, const void *b)
     return *(const int *)a - *(const int *)b;
 }
 
-/* /dev/rdiskN (без sN) = целый raw-диск; разбиения нам не нужны */
+/* /dev/rdiskN (raw) и /dev/diskN (buffered) - только целые диски,
+ * разбиения (sN) не подмешиваем: их бессмысленно гонять целиком.
+ * Пары идут рядом, чтобы можно было сравнить raw/buffered. */
 static NSArray *scan_disks(void)
 {
     NSMutableArray *a = [NSMutableArray array];
     DIR            *d = opendir("/dev");
     struct dirent  *e;
     int             nums[64];
-    int             n = 0, i;
+    int             n = 0, i, j, dup;
 
     if (d != NULL) {
         while ((e = readdir(d)) != NULL) {
             const char *nm = e->d_name;
             const char *p;
-            int         val = 0, ok = 1;
+            int         val = 0, ok = 1, raw;
 
-            if (strncmp(nm, "rdisk", 5) != 0)
+            if (strncmp(nm, "rdisk", 5) == 0) {
+                raw = 1;
+                p = nm + 5;
+            } else if (strncmp(nm, "disk", 4) == 0) {
+                raw = 0;
+                p = nm + 4;
+            } else {
                 continue;
-            p = nm + 5;
+            }
             if (*p == 0)
                 continue;
             while (*p) {
@@ -163,17 +182,35 @@ static NSArray *scan_disks(void)
                 val = val * 10 + (*p - '0');
                 p++;
             }
-            if (ok && n < 64)
+            if (!ok)
+                continue;
+
+            dup = 0;
+            for (j = 0; j < n; j++)
+                if (nums[j] == val)
+                    dup = 1;
+            if (dup)
+                continue;
+            if (n < 64)
                 nums[n++] = val;
         }
         closedir(d);
     }
 
     qsort(nums, (size_t)n, sizeof(int), intcmp);
+
     for (i = 0; i < n; i++) {
-        char b[32];
-        snprintf(b, sizeof b, "/dev/rdisk%d", nums[i]);
-        [a addObject:[NSString stringWithUTF8String:b]];
+        char pa[64], pb[64];
+        int  have_raw, have_buf;
+
+        snprintf(pa, sizeof pa, "/dev/rdisk%d", nums[i]);
+        snprintf(pb, sizeof pb, "/dev/disk%d",  nums[i]);
+        have_raw = (access(pa, F_OK) == 0);
+        have_buf = (access(pb, F_OK) == 0);
+        if (have_raw)
+            [a addObject:[NSString stringWithUTF8String:pa]];
+        if (have_buf)
+            [a addObject:[NSString stringWithUTF8String:pb]];
     }
     return a;
 }
@@ -805,6 +842,21 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
         mock_lin_tick();
     if (g_rnd_on)
         mock_rnd_tick();
+
+    if (g_cycle) {
+        g_cycle_ticks++;
+        if (g_cycle_ticks % (int)(3.0 / TICK_SEC) == 0) {
+            int cur = (int)[g_tabs indexOfTabViewItem:
+                                [g_tabs selectedTabViewItem]];
+            int nxt = (cur == 0) ? 1 : 0;
+            [g_tabs selectTabViewItemAtIndex:nxt];
+            printf("cycle: tab %d -> %d   lin_n %d   rnd_n %d\n",
+                   cur, nxt, g_lin_n, g_rnd_n);
+            fflush(stdout);
+            [g_lin_view setNeedsDisplay:YES];
+            [g_rnd_view setNeedsDisplay:YES];
+        }
+    }
 }
 
 - (void)quit:(id)s
@@ -1091,6 +1143,16 @@ int main(int argc, char *argv[])
             } else if ([a isEqualToString:@"-rnd"]) {
                 [g_tabs selectTabViewItemAtIndex:1];
                 mock_rnd_start();
+            } else if ([a isEqualToString:@"-cycle"]) {
+                g_cycle = 1;      /* оба мока + авто-щёлканье вкладок */
+                mock_lin_start();
+                mock_rnd_start();
+            } else if ([a isEqualToString:@"-devs"]) {
+                NSArray *dl = scan_disks();
+                int k;
+                for (k = 0; k < (int)[dl count]; k++)
+                    printf("%s\n", [[dl objectAtIndex:k] UTF8String]);
+                exit(0);
             }
         }
     }
