@@ -6,36 +6,16 @@
  * в данные не идёт, медиана/p99 считаются по накопленным лагам.
  */
 #include "dgrndcore.h"
+#include "dgdev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
-#include <sys/disk.h>
-#include <mach/mach_time.h>
 
 #define SECT 512ULL
-
-/* ------------------------------------------------------------ clock */
-static double g_ns_per_tick = 0.0;
-
-static void clock_init(void)
-{
-    mach_timebase_info_data_t tb;
-
-    if (g_ns_per_tick > 0.0)
-        return;
-    mach_timebase_info(&tb);
-    g_ns_per_tick = (double)tb.numer / (double)tb.denom;
-}
-
-static uint64_t ticks_us(void)
-{
-    return (uint64_t)((double)mach_absolute_time() * g_ns_per_tick / 1000.0);
-}
 
 /* ------------------------------------------------------------ rng */
 static uint64_t g_rng;
@@ -55,27 +35,6 @@ static uint64_t rng_next(void)
     return x * 2685821657736338717ULL;
 }
 
-/* ------------------------------------------------------------ stats */
-static int dcmp(const void *a, const void *b)
-{
-    double x = *(const double *)a, y = *(const double *)b;
-    return (x > y) - (x < y);
-}
-
-static double pct(const double *v, size_t n, double p)
-{
-    double idx;
-    size_t i;
-
-    if (n == 0)
-        return 0.0;
-    idx = p * (double)(n - 1);
-    i = (size_t)(idx + 0.5);
-    if (i >= n)
-        i = n - 1;
-    return v[i];
-}
-
 /* ------------------------------------------------------------ core */
 
 int dgrndcore(const dgrndcfg *cfg,
@@ -89,7 +48,6 @@ int dgrndcore(const dgrndcfg *cfg,
 {
     int      fd = -1;
     uint64_t rblk, cap, nslots, off, seed;
-    uint32_t bs = 512;
     char    *buf = NULL;
     double  *lat = NULL;
     size_t   lcap = 1 << 12, ln = 0;
@@ -120,45 +78,11 @@ int dgrndcore(const dgrndcfg *cfg,
     if (seed == 0)
         seed = (uint64_t)time(NULL) ^ (uint64_t)getpid();
 
-    clock_init();
+    dg_clock_init();
 
-    fd = open(cfg->dev, O_RDONLY);
-    if (fd < 0) {
-        if (errno == EACCES || errno == EPERM)
-            snprintf(errbuf, errlen,
-                     "cannot open %s: %s (raw nodes are root:operator; "
-                     "run under sudo; use /dev/rdiskN)",
-                     cfg->dev, strerror(errno));
-        else
-            snprintf(errbuf, errlen, "cannot open %s: %s",
-                     cfg->dev, strerror(errno));
+    fd = dg_open_raw(cfg->dev, &cap, &res->oserr, errbuf, errlen);
+    if (fd < 0)
         return -1;
-    }
-
-    if (ioctl(fd, DKIOCGETBLOCKSIZE, &bs) < 0)
-        bs = 512;
-    if (ioctl(fd, DKIOCGETBLOCKCOUNT, &off) < 0) {
-        snprintf(errbuf, errlen, "ioctl(DKIOCGETBLOCKCOUNT) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
-
-    cap = off * (uint64_t)bs;
-    if (cap == 0) {
-        snprintf(errbuf, errlen, "zero capacity reported by %s", cfg->dev);
-        goto out;
-    }
-
-    if (fcntl(fd, F_NOCACHE, 1) < 0) {
-        snprintf(errbuf, errlen, "fcntl(F_NOCACHE) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
-    if (fcntl(fd, F_RDAHEAD, 0) < 0) {
-        snprintf(errbuf, errlen, "fcntl(F_RDAHEAD) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
 
     if (rblk > cap) {
         snprintf(errbuf, errlen, "block bigger than the device");
@@ -211,9 +135,9 @@ int dgrndcore(const dgrndcfg *cfg,
 
         off = (rng_next() % nslots) * SECT;
 
-        t0 = ticks_us();
+        t0 = dg_now_us();
         r = pread(fd, buf, (size_t)rblk, (off_t)off);
-        dt = ticks_us() - t0;
+        dt = dg_now_us() - t0;
         t_io += dt;
 
         if (r < 0) {
@@ -254,13 +178,13 @@ int dgrndcore(const dgrndcfg *cfg,
         ops++;
     }
 
-    qsort(lat, ln, sizeof(double), dcmp);
+    qsort(lat, ln, sizeof(double), dg_dcmp);
 
     res->ops     = ops;
     res->eio     = eio;
     res->time_us = t_io;
-    res->med_us  = pct(lat, ln, 0.50);
-    res->p99_us  = pct(lat, ln, 0.99);
+    res->med_us  = dg_pct(lat, ln, 0.50);
+    res->p99_us  = dg_pct(lat, ln, 0.99);
     res->avg_us  = (ln > 0) ? (double)t_io / (double)ln : 0.0;
     res->stopped = (cancel != NULL && *cancel) ? 1 : 0;
 

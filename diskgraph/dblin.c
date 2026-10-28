@@ -13,6 +13,7 @@
  * Только ЧТЕНИЕ. Запись не выполняется никогда.
  */
 #include "dglincore.h"
+#include "dgdev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -225,7 +226,11 @@ int main(int argc, char **argv)
     rc = dglincore(&cfg, out_begin, out_seg, out_err, &out,
                    &g_stop, &res, err, sizeof err);
     if (rc != 0) {
-        fprintf(stderr, "dblin: %s\n", err);
+        fprintf(stderr, "dblin: %s%s\n", err,
+                dg_is_perm_err(res.oserr)
+                    ? " (raw nodes are root:operator; run under sudo; "
+                      "use /dev/rdiskN)"
+                    : "");
         return 1;
     }
 

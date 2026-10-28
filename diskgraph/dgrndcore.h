@@ -51,6 +51,7 @@ typedef struct {
     double   p99_us;
     double   avg_us;
     int      stopped;
+    int      oserr;      /* errno фатальной ошибки (0 - нет)    */
 } dgrndresult;
 
 typedef void (*dgrnd_begin_fn)(void *ctx, const dgrndinfo *info);

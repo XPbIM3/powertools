@@ -13,6 +13,7 @@
  * Только ЧТЕНИЕ. Запись не выполняется никогда.
  */
 #include "dgrndcore.h"
+#include "dgdev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,7 +199,11 @@ int main(int argc, char **argv)
     rc = dgrndcore(&cfg, out_begin, out_op, out_err, &out,
                    &g_stop, &res, err, sizeof err);
     if (rc != 0) {
-        fprintf(stderr, "dbrnd: %s\n", err);
+        fprintf(stderr, "dbrnd: %s%s\n", err,
+                dg_is_perm_err(res.oserr)
+                    ? " (raw nodes are root:operator; run under sudo; "
+                      "use /dev/rdiskN)"
+                    : "");
         return 1;
     }
 

@@ -8,35 +8,15 @@
  * err (ошибка блока). Никакого stdout.
  */
 #include "dglincore.h"
+#include "dgdev.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/disk.h>
-#include <mach/mach_time.h>
 
 #define SECT 512ULL
-
-/* ------------------------------------------------------------ clock */
-static double g_ns_per_tick = 0.0;
-
-static void clock_init(void)
-{
-    mach_timebase_info_data_t tb;
-
-    if (g_ns_per_tick > 0.0)
-        return;                       /* гонка безобидна: число то же */
-    mach_timebase_info(&tb);
-    g_ns_per_tick = (double)tb.numer / (double)tb.denom;
-}
-
-static uint64_t ticks_us(void)
-{
-    return (uint64_t)((double)mach_absolute_time() * g_ns_per_tick / 1000.0);
-}
 
 /* ------------------------------------------------------------ core */
 
@@ -50,8 +30,7 @@ int dglincore(const dglincfg *cfg,
               char *errbuf, size_t errlen)
 {
     int      fd = -1;
-    uint64_t seg, blk, cap, maxoff, skip, off, t;
-    uint32_t bs = 512;
+    uint64_t seg, blk, cap, maxoff, skip, off;
     char    *buf = NULL;
     int      rc = -1;
     dglininfo info;
@@ -81,45 +60,11 @@ int dglincore(const dglincfg *cfg,
         return -1;
     }
 
-    clock_init();
+    dg_clock_init();
 
-    fd = open(cfg->dev, O_RDONLY);
-    if (fd < 0) {
-        if (errno == EACCES || errno == EPERM)
-            snprintf(errbuf, errlen,
-                     "cannot open %s: %s (raw nodes are root:operator; "
-                     "run under sudo; use /dev/rdiskN)",
-                     cfg->dev, strerror(errno));
-        else
-            snprintf(errbuf, errlen, "cannot open %s: %s",
-                     cfg->dev, strerror(errno));
+    fd = dg_open_raw(cfg->dev, &cap, &res->oserr, errbuf, errlen);
+    if (fd < 0)
         return -1;
-    }
-
-    if (ioctl(fd, DKIOCGETBLOCKSIZE, &bs) < 0)
-        bs = 512;
-    if (ioctl(fd, DKIOCGETBLOCKCOUNT, &t) < 0) {
-        snprintf(errbuf, errlen, "ioctl(DKIOCGETBLOCKCOUNT) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
-
-    cap = t * (uint64_t)bs;
-    if (cap == 0) {
-        snprintf(errbuf, errlen, "zero capacity reported by %s", cfg->dev);
-        goto out;
-    }
-
-    if (fcntl(fd, F_NOCACHE, 1) < 0) {
-        snprintf(errbuf, errlen, "fcntl(F_NOCACHE) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
-    if (fcntl(fd, F_RDAHEAD, 0) < 0) {
-        snprintf(errbuf, errlen, "fcntl(F_RDAHEAD) on %s: %s",
-                 cfg->dev, strerror(errno));
-        goto out;
-    }
 
     maxoff = (cfg->extent == 0 || cfg->extent > cap) ? cap : cfg->extent;
     maxoff -= maxoff % SECT;
@@ -188,9 +133,9 @@ int dglincore(const dglincfg *cfg,
             if (chunk > blk)
                 chunk = blk;
 
-            t0 = ticks_us();
+            t0 = dg_now_us();
             r = pread(fd, buf, (size_t)chunk, (off_t)(off + pos));
-            dt = ticks_us() - t0;
+            dt = dg_now_us() - t0;
             res->time_us += dt;
 
             if (r < 0) {

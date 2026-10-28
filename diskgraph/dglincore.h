@@ -57,6 +57,7 @@ typedef struct {
     uint64_t eio;
     uint64_t time_us;
     int      stopped;    /* 1 = прервано cancel-флагом          */
+    int      oserr;      /* errno фатальной ошибки (0 - нет)    */
 } dglinresult;
 
 /* on_begin зовётся один раз после опроса геометрии, до прогрева */

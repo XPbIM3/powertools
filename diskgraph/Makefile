@@ -25,11 +25,12 @@ $(TARGET): dbsweep.c
 
 # консольные тулзы: тонкие обёртки над общими ядрами dglincore/dgrndcore
 # (те же ядра зовёт UI). Человекочитаемый stdout, ноль CSV.
-$(LIN): dblin.c dglincore.c dglincore.h
-	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(LIN) dblin.c dglincore.c
+# dgdev - общее: часы, открытие raw-ноды, ёмкость, перцентили
+$(LIN): dblin.c dglincore.c dglincore.h dgdev.c dgdev.h
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(LIN) dblin.c dglincore.c dgdev.c
 
-$(RND): dbrnd.c dgrndcore.c dgrndcore.h
-	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(RND) dbrnd.c dgrndcore.c
+$(RND): dbrnd.c dgrndcore.c dgrndcore.h dgdev.c dgdev.h
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(RND) dbrnd.c dgrndcore.c dgdev.c
 
 # ступень 2: пробник рисования (окно NSView + drawRect) - objc1
 # конструкции, кросс с Leopard на все клетки 10.2..10.5
@@ -42,8 +43,8 @@ $(APP): $(PROBE).m Info.plist
 # ступень 4b: UI зовёт ядра dglincore/dgrndcore напрямую (pthread),
 # без внешних процессов и stdout-обмена
 $(APP2): diskgraph.m dglincore.c dgrndcore.c dglincore.h dgrndcore.h \
-         Info-diskgraph.plist
-	$(CC) $(APPFLAGS) diskgraph.m -x none dglincore.c dgrndcore.c \
+         dgdev.c dgdev.h Info-diskgraph.plist
+	$(CC) $(APPFLAGS) diskgraph.m -x none dglincore.c dgrndcore.c dgdev.c \
 	      -lpthread -o diskgraph
 	@mkdir -p $(APP2)/Contents/MacOS $(APP2)/Contents/Resources
 	@cp Info-diskgraph.plist $(APP2)/Contents/Info.plist
