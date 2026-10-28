@@ -23,13 +23,13 @@ all: $(TARGET) $(LIN) $(RND) $(APP) $(APP2)
 $(TARGET): dbsweep.c
 	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(TARGET) dbsweep.c
 
-# консольные тулзы (фаза UI на паузе): линейный пунктир и random
-# по времени; человекочитаемый stdout, ноль CSV
-$(LIN): dblin.c
-	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(LIN) dblin.c
+# консольные тулзы: тонкие обёртки над общими ядрами dglincore/dgrndcore
+# (те же ядра зовёт UI). Человекочитаемый stdout, ноль CSV.
+$(LIN): dblin.c dglincore.c dglincore.h
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(LIN) dblin.c dglincore.c
 
-$(RND): dbrnd.c
-	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(RND) dbrnd.c
+$(RND): dbrnd.c dgrndcore.c dgrndcore.h
+	$(CC) $(CFLAGS) $(TARGET_FLAGS) -o $(RND) dbrnd.c dgrndcore.c
 
 # ступень 2: пробник рисования (окно NSView + drawRect) - objc1
 # конструкции, кросс с Leopard на все клетки 10.2..10.5
@@ -39,13 +39,15 @@ $(APP): $(PROBE).m Info.plist
 	@cp Info.plist $(APP)/Contents/
 	@cp $(PROBE) $(APP)/Contents/MacOS/
 
-# ступень 3: боевая тулза - DiskGraph UI + движок dbsweep в Resources
-$(APP2): diskgraph.m Info-diskgraph.plist $(TARGET)
-	$(CC) $(APPFLAGS) -o diskgraph diskgraph.m
+# ступень 4b: UI зовёт ядра dglincore/dgrndcore напрямую (pthread),
+# без внешних процессов и stdout-обмена
+$(APP2): diskgraph.m dglincore.c dgrndcore.c dglincore.h dgrndcore.h \
+         Info-diskgraph.plist
+	$(CC) $(APPFLAGS) diskgraph.m -x none dglincore.c dgrndcore.c \
+	      -lpthread -o diskgraph
 	@mkdir -p $(APP2)/Contents/MacOS $(APP2)/Contents/Resources
 	@cp Info-diskgraph.plist $(APP2)/Contents/Info.plist
 	@cp diskgraph $(APP2)/Contents/MacOS/
-	@cp $(TARGET) $(APP2)/Contents/Resources/
 
 clean:
 	rm -f $(TARGET) $(LIN) $(RND) $(PROBE) diskgraph

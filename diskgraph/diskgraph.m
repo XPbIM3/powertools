@@ -1,53 +1,45 @@
 /*
- * diskgraph.m - UI этап 4a: две вкладки (Linear / Random) на мок-данных
+ * diskgraph.m - UI DiskGraph: две вкладки (Linear / Random) на РЕАЛЬНЫХ
+ *               замерах через dglincore/dgrndcore
  *
- * Отладка ВНЕШНЕГО ВИДА без запуска алгоритмов: графики питаются
- * искусственными данными, сгенерированными по профилю реального
- * disk0 (quicksilver, 55.9 G):
- *   - linear: зонный спад 36 -> 24 MB/s, шум +-0.5, редкие провалы;
- *             кривая отрастает слева направо по мере "прохода";
- *   - random: лаг 4K-чтений вокруг 14.3 ms, спайки до 40 ms;
- *             точки постятся пачками по мере "замера".
+ * Фронт и бэк скрещены: вкладки зовут те же ядра, что и консольные
+ * dblin/dbrnd, но данные приходят не в stdout, а в sink-калбеки:
+ *   - linear: sink сегмента -> точка (offset, MB/s) на графике;
+ *   - random: sink опа     -> точка (offset, лаг ms) на scatter.
  *
- * Правила вида (после ревизии):
- *   - прогресс/сводка живут ТОЛЬКО в статус-строке вкладки, на графике
- *     их нет - никакого дублирования;
- *   - у осей есть подписи: X - "поверхность диска, GB", Y - "MB/s"/"ms";
- *   - Y-шкала подгоняется под данные (круглые деления, без пустого верха);
- *   - вкладка тянется вместе с окном, график не вылезает за контент;
- *   - селектор устройства на каждой вкладке: /dev/rdiskN (raw) и
- *     /dev/diskN (buffered) - парами, чтобы сравнивать; на этом этапе
- *     выбор чисто визуальный, реального чтения нет.
+ * Поток: UI-поток (AppKit) + один рабочий поток на запуск (pthread).
+ * Данные лежат в общих массивах под мьютексом; таймер 0.25 c
+ * перерисовывает и обновляет статус. Никаких stdout-обменов.
  *
- * Dev-хуки (для скриншотов и проверок): -lin / -rnd автостарт мока,
- * -cycle сам щёлкает вкладки и печатает счётчики точек (проверка, что
- * данные не теряются), -devs печатает список дисков и выходит,
- * -w N -h N задают стартовый размер окна.
+ * Права: чтение /dev/rdiskN требует root, поэтому приложение надо
+ * запускать через sudo (подъём прав при старте - следующий шаг).
  *
- * Стык для будущего движка: мок-слой гадит данные через те же
- * pts_add/массивы, что потом будет наполнять sink настоящего ядра
- * (dglincore/dgrndcore). UI-код переписывать не придётся.
- *
- * Рамки этапа: NO IOKit, NO root/Auth, NO реальных дисков - только
- * вид, вкладки, слайдеры, живой рендер.
+ * Только ЧТЕНИЕ. Запись не выполняется никогда.
  *
  * ObjC строго objc1 (Jaguar..Leopard runtime): без @"..."-литералов,
- * без свойств и fast enumeration - стиль diskgauge/graphprobe.
+ * без свойств и fast enumeration.
  */
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #include <dirent.h>
 #include <sys/types.h>
+#include <sys/disk.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
 #include <math.h>
 
-/* ---- мок-геометрия: реальный disk0 quicksilver-g4-867 ---- */
-#define MOCK_CAP   (60021399040.0)          /* 55.90 G, байты */
-#define MOCK_CHUNK (32.0 * 1048576.0)       /* 32 MiB чанк    */
-#define MOCK_OPS_PER_S 70                   /* ops/s random   */
-#define TICK_SEC   0.25                     /* шаг мока       */
+#include "dglincore.h"
+#include "dgrndcore.h"
 
-/* окно/вкладка */
+/* ---- параметры приборов (как в консольных тулзах) ---- */
+#define LIN_SEG (32ULL << 20)      /* 32 MiB чанк  */
+#define LIN_BLK (1ULL  << 20)      /* 1 MiB блок   */
+#define RND_BLK 4096ULL            /* 4 KiB        */
+#define RND_WARMUP 16
+#define TICK_SEC 0.25
+
 #define WIN_W 1000.0f
 #define WIN_H  720.0f
 
@@ -59,34 +51,43 @@ typedef struct {
 static dpt *g_lin = NULL;  static int g_lin_n = 0;
 static dpt *g_rnd = NULL;  static int g_rnd_n = 0;
 
-static double g_cap = MOCK_CAP;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* параметры "приборов" (слайдеры) и выбранное устройство */
-static int  g_duty     = 10;
+/* ---- состояние прогонов ---- */
+static int  g_run = 0;                  /* 0 idle, 1 linear, 2 random */
+static volatile int g_lin_cancel = 0;
+static volatile int g_rnd_cancel = 0;
+static int  g_lin_done = 0, g_rnd_done = 0;
+static int  g_lin_failed = 0, g_rnd_failed = 0;
+static char g_lin_err[256] = "";
+static char g_rnd_err[256] = "";
+static dglinresult g_lin_res;
+static dgrndresult g_rnd_res;
+static uint64_t g_lin_total = 0;
+static uint64_t g_lin_eio = 0;
+static int      g_lin_idx_done = 0;     /* сегментов завершено */
+static int      g_lin_elapsed = 0;      /* длительность прогона, с */
+static int      g_rnd_elapsed_done = 0;
+static time_t   g_run_t0 = 0;
+
+/* снимок параметров на момент Старт */
+static char g_lin_path[64] = "";
+static int  g_lin_duty = 10;
+static char g_rnd_path[64] = "";
 static int  g_rnd_secs = 30;
-static char g_dev[64]  = "/dev/rdisk0";
 
-/* состояние мока */
-static int    g_lin_on = 0;
-static int    g_lin_chunks = 0;   /* сегментов в текущем проходе */
-static int    g_lin_idx = 0;
-static int    g_lin_feed = 1;     /* сегментов за тик            */
-static double g_lin_skip = 0.0;
+/* значения слайдеров */
+static int g_duty = 10;
 
-static int    g_rnd_on = 0;
-static double g_rnd_elapsed = 0.0;
-
-/* dev-хук -cycle: сам щёлкает вкладки и печатает счётчики точек */
-static int    g_cycle = 0;
-static int    g_cycle_ticks = 0;
-
-/* UI-хвосты */
+/* ---- UI ---- */
 static NSTextField   *g_lin_status = NULL;
 static NSTextField   *g_rnd_status = NULL;
 static NSTextField   *g_duty_val  = NULL;
 static NSTextField   *g_secs_val  = NULL;
 static NSButton      *g_lin_start = NULL;
 static NSButton      *g_rnd_start = NULL;
+static NSSlider      *g_lin_slider = NULL;
+static NSSlider      *g_rnd_slider = NULL;
 static NSView        *g_lin_view = NULL;
 static NSView        *g_rnd_view = NULL;
 static NSPopUpButton *g_lin_dev = NULL;
@@ -94,16 +95,31 @@ static NSPopUpButton *g_rnd_dev = NULL;
 static NSTabView     *g_tabs = NULL;
 static NSView        *g_root = NULL;
 
+/* выбранное устройство (общее для вкладок) */
+static char g_dev[64] = "/dev/rdisk0";
+
+/* ёмкость того устройства, что реально читали (для оси X) */
+static double g_cap = 0.0;
+
+/* dev-хук -cycle */
+static int g_cycle = 0;
+static int g_cycle_ticks = 0;
+
+/* dev-хук -stop N: через N секунд после старта нажать "Стоп" */
+static time_t g_stop_at = 0;
+
+/* dev-хук -again: после завершения прогона сразу стартовать снова */
+static int g_again = 0;
+
 /* ------------------------------------------------------------ данные */
 
+/* вызывать под g_lock */
 static int pts_add(dpt **arr, int *npt, double off, double val)
 {
-    {
-        dpt *p = (dpt *)realloc(*arr, (size_t)(*npt + 1) * sizeof(dpt));
-        if (p == NULL)
-            return 0;
-        *arr = p;
-    }
+    dpt *p = (dpt *)realloc(*arr, (size_t)(*npt + 1) * sizeof(dpt));
+    if (p == NULL)
+        return 0;
+    *arr = p;
     (*arr)[*npt].off = off;
     (*arr)[*npt].val = val;
     (*npt)++;
@@ -149,9 +165,8 @@ static int intcmp(const void *a, const void *b)
     return *(const int *)a - *(const int *)b;
 }
 
-/* /dev/rdiskN (raw) и /dev/diskN (buffered) - только целые диски,
- * разбиения (sN) не подмешиваем: их бессмысленно гонять целиком.
- * Пары идут рядом, чтобы можно было сравнить raw/buffered. */
+/* /dev/rdiskN (raw) и /dev/diskN (buffered) - только целые диски;
+ * разбиения (sN) не нужны, пары идут рядом для сравнения */
 static NSArray *scan_disks(void)
 {
     NSMutableArray *a = [NSMutableArray array];
@@ -164,13 +179,11 @@ static NSArray *scan_disks(void)
         while ((e = readdir(d)) != NULL) {
             const char *nm = e->d_name;
             const char *p;
-            int         val = 0, ok = 1, raw;
+            int         val = 0, ok = 1;
 
             if (strncmp(nm, "rdisk", 5) == 0) {
-                raw = 1;
                 p = nm + 5;
             } else if (strncmp(nm, "disk", 4) == 0) {
-                raw = 0;
                 p = nm + 4;
             } else {
                 continue;
@@ -201,15 +214,12 @@ static NSArray *scan_disks(void)
 
     for (i = 0; i < n; i++) {
         char pa[64], pb[64];
-        int  have_raw, have_buf;
 
         snprintf(pa, sizeof pa, "/dev/rdisk%d", nums[i]);
         snprintf(pb, sizeof pb, "/dev/disk%d",  nums[i]);
-        have_raw = (access(pa, F_OK) == 0);
-        have_buf = (access(pb, F_OK) == 0);
-        if (have_raw)
+        if (access(pa, F_OK) == 0)
             [a addObject:[NSString stringWithUTF8String:pa]];
-        if (have_buf)
+        if (access(pb, F_OK) == 0)
             [a addObject:[NSString stringWithUTF8String:pb]];
     }
     return a;
@@ -229,8 +239,7 @@ static void fill_dev_popup(NSPopUpButton *pop)
     for (i = 0; i < (int)[disks count]; i++) {
         NSString *t = [disks objectAtIndex:i];
         [pop addItemWithTitle:t];
-        if ([t isEqualToString:
-                [NSString stringWithUTF8String:g_dev]])
+        if ([t isEqualToString:[NSString stringWithUTF8String:g_dev]])
             sel = i;
     }
 
@@ -251,140 +260,346 @@ static void refresh_devs(void)
     if (g_rnd_dev != NULL) fill_dev_popup(g_rnd_dev);
 }
 
-/* ------------------------------------------------------- мок-двигалка */
-
-/* профиль поверхности: внешние зоны быстрее, шум, редкие провалы */
-static double mock_lin_value(double off)
+/* ёмкость для оси X ещё до Старта (нужен root; иначе 0 = нет тиков) */
+static double probe_capacity(const char *path)
 {
-    double frac = off / g_cap;
-    double base = 36.5 - 13.0 * frac;
-    double noise = ((double)rand() / (double)RAND_MAX - 0.5) * 1.0;
-    if ((double)rand() / (double)RAND_MAX < 0.03)
-        base -= 5.0 + 4.0 * ((double)rand() / (double)RAND_MAX);
-    return base + noise;
+    int      fd;
+    uint32_t bs = 512;
+    uint64_t n = 0;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0.0;
+    if (ioctl(fd, DKIOCGETBLOCKSIZE, &bs) < 0)
+        bs = 512;
+    if (ioctl(fd, DKIOCGETBLOCKCOUNT, &n) < 0) {
+        close(fd);
+        return 0.0;
+    }
+    close(fd);
+    return (double)n * (double)bs;
 }
 
-/* лаг random 4K: сгущение у 13-15 ms + редкий спайк до ~40 ms */
-static double mock_rnd_value(void)
-{
-    double u = (double)rand() / (double)RAND_MAX;
-    double v = (double)rand() / (double)RAND_MAX;
-    double ms = 13.2 + 6.0 * u * v * 2.0;
-    if ((double)rand() / (double)RAND_MAX < 0.02)
-        ms += 10.0 + 15.0 * ((double)rand() / (double)RAND_MAX);
-    return ms * 1000.0;
-}
+/* ------------------------------------------------------- статус-строки */
 
+/* вызывать без g_lock */
 static void status_lin(void)
 {
-    char s[192];
-    if (g_lin_n == 0 && !g_lin_on) {
-        snprintf(s, sizeof s, "linear: нет данных - нажмите Старт");
-    } else if (g_lin_on) {
+    char s[320];
+    int  n, idx, failed, canc;
+    uint64_t total, eio;
+    double avg;
+    dglinresult res;
+
+    pthread_mutex_lock(&g_lock);
+    n      = g_lin_n;
+    idx    = g_lin_idx_done;
+    total  = g_lin_total;
+    eio    = g_lin_eio;
+    failed = g_lin_failed;
+    canc   = g_lin_cancel;
+    avg    = avg_of(g_lin, g_lin_n);
+    res    = g_lin_res;
+    s[0] = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    if (g_run == 1) {
+        if (canc) {
+            snprintf(s, sizeof s,
+                     "linear: останавливаюсь после текущего блока...");
+        } else if (total > 0) {
+            snprintf(s, sizeof s,
+                     "linear: сегмент %d / %llu   avg %.1f MB/s   "
+                     "duty %d%%",
+                     idx, (unsigned long long)total, avg, g_lin_duty);
+        } else {
+            snprintf(s, sizeof s, "linear: открываю %s ...", g_lin_path);
+        }
+    } else if (failed) {
+        pthread_mutex_lock(&g_lock);
+        snprintf(s, sizeof s, "linear: ошибка: %s", g_lin_err);
+        pthread_mutex_unlock(&g_lock);
+    } else if (n > 0) {
+        double mbs = res.time_us > 0
+            ? (double)res.bytes / ((double)res.time_us / 1e6) / 1048576.0
+            : 0.0;
         snprintf(s, sizeof s,
-                 "linear: сегмент %d / %d   avg %.1f MB/s   duty %d%%",
-                 g_lin_idx, g_lin_chunks,
-                 avg_of(g_lin, g_lin_n), g_duty);
+                 "linear готово: %llu сегментов   avg %.1f MB/s   "
+                 "eio %llu   время %d:%02d%s",
+                 (unsigned long long)res.chunks, mbs,
+                 (unsigned long long)res.eio,
+                 g_lin_elapsed / 60, g_lin_elapsed % 60,
+                 res.stopped ? "   [остановлено]" : "");
     } else {
-        snprintf(s, sizeof s,
-                 "linear готово: %d сегментов   avg %.1f MB/s   duty %d%%",
-                 g_lin_n, avg_of(g_lin, g_lin_n), g_duty);
+        snprintf(s, sizeof s, "linear: нет данных - нажмите Старт");
     }
+
     [g_lin_status setStringValue:[NSString stringWithUTF8String:s]];
 }
 
+/* вызывать без g_lock */
 static void status_rnd(void)
 {
-    char s[192];
-    if (g_rnd_n == 0 && !g_rnd_on) {
-        snprintf(s, sizeof s, "random: нет данных - нажмите Старт");
-    } else if (g_rnd_on) {
+    char s[320];
+    int  n, failed, canc, secs, elapsed;
+    double med, p99;
+    dgrndresult res;
+
+    pthread_mutex_lock(&g_lock);
+    n       = g_rnd_n;
+    failed  = g_rnd_failed;
+    canc    = g_rnd_cancel;
+    res     = g_rnd_res;
+    med     = pctl_of(g_rnd, g_rnd_n, 0.50) / 1000.0;
+    p99     = pctl_of(g_rnd, g_rnd_n, 0.99) / 1000.0;
+    secs    = g_rnd_secs;
+    s[0] = 0;
+    pthread_mutex_unlock(&g_lock);
+
+    elapsed = (int)(time(NULL) - g_run_t0);
+    if (elapsed < 0) elapsed = 0;
+    if (elapsed > secs) elapsed = secs;
+
+    if (g_run == 2) {
+        if (canc) {
+            snprintf(s, sizeof s, "random: останавливаюсь...");
+        } else {
+            snprintf(s, sizeof s,
+                     "random: ops %d   %d / %d s   med %.1f ms   "
+                     "p99 %.1f ms",
+                     n, elapsed, secs, med, p99);
+        }
+    } else if (failed) {
+        pthread_mutex_lock(&g_lock);
+        snprintf(s, sizeof s, "random: ошибка: %s", g_rnd_err);
+        pthread_mutex_unlock(&g_lock);
+    } else if (n > 0) {
+        double m = res.med_us / 1000.0;
+        double p = res.p99_us / 1000.0;
         snprintf(s, sizeof s,
-                 "random: ops %d   %.1f / %d s   med %.1f ms   p99 %.1f ms",
-                 g_rnd_n, g_rnd_elapsed, g_rnd_secs,
-                 pctl_of(g_rnd, g_rnd_n, 0.50) / 1000.0,
-                 pctl_of(g_rnd, g_rnd_n, 0.99) / 1000.0);
+                 "random готово: %llu ops   med %.1f ms   p99 %.1f ms   "
+                 "eio %llu   время %d:%02d%s",
+                 (unsigned long long)res.ops, m, p,
+                 (unsigned long long)res.eio,
+                 g_rnd_elapsed_done / 60, g_rnd_elapsed_done % 60,
+                 res.stopped ? "   [остановлено]" : "");
     } else {
-        snprintf(s, sizeof s,
-                 "random готово: %d ops   med %.1f ms   p99 %.1f ms",
-                 g_rnd_n,
-                 pctl_of(g_rnd, g_rnd_n, 0.50) / 1000.0,
-                 pctl_of(g_rnd, g_rnd_n, 0.99) / 1000.0);
+        snprintf(s, sizeof s, "random: нет данных - нажмите Старт");
     }
+
     [g_rnd_status setStringValue:[NSString stringWithUTF8String:s]];
 }
 
-static void mock_lin_start(void)
+/* ------------------------------------------------------- рабочие потоки */
+
+static void lin_begin(void *ctx, const dglininfo *info)
 {
-    if (g_lin_on)
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    g_lin_total = info->chunks;
+    g_cap = (double)info->capacity;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void lin_seg(void *ctx, const dglinseg *seg)
+{
+    double mbs;
+    (void)ctx;
+
+    mbs = seg->time_us > 0
+        ? (double)seg->bytes / ((double)seg->time_us / 1e6) / 1048576.0
+        : 0.0;
+
+    pthread_mutex_lock(&g_lock);
+    pts_add(&g_lin, &g_lin_n, (double)seg->off, mbs);
+    g_lin_eio += seg->eio;
+    g_lin_idx_done = (int)(seg->index + 1);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void lin_err(void *ctx, const dglinerr *e)
+{
+    (void)ctx;
+    (void)e;
+}
+
+static void *lin_thread(void *arg)
+{
+    dglincfg    cfg;
+    dglinresult res;
+    char        err[256];
+    int         rc;
+
+    (void)arg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.dev    = g_lin_path;
+    cfg.seg    = LIN_SEG;
+    cfg.blk    = LIN_BLK;
+    cfg.duty   = g_lin_duty;
+    cfg.extent = 0;
+
+    rc = dglincore(&cfg, lin_begin, lin_seg, lin_err, NULL,
+                   &g_lin_cancel, &res, err, sizeof err);
+
+    pthread_mutex_lock(&g_lock);
+    if (rc != 0) {
+        snprintf(g_lin_err, sizeof g_lin_err, "%s", err);
+        g_lin_failed = 1;
+        memset(&res, 0, sizeof res);
+    } else {
+        g_lin_failed = 0;
+    }
+    g_lin_res = res;
+    g_lin_elapsed = (int)(time(NULL) - g_run_t0);
+    g_lin_done = 1;
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+static void rnd_begin(void *ctx, const dgrndinfo *info)
+{
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    g_cap = (double)info->capacity;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void rnd_op(void *ctx, const dgrndop *op)
+{
+    (void)ctx;
+    pthread_mutex_lock(&g_lock);
+    pts_add(&g_rnd, &g_rnd_n, (double)op->off, (double)op->us);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void rnd_err(void *ctx, const dgrnderr *e)
+{
+    (void)ctx;
+    (void)e;
+}
+
+static void *rnd_thread(void *arg)
+{
+    dgrndcfg    cfg;
+    dgrndresult res;
+    char        err[256];
+    int         rc;
+
+    (void)arg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.dev    = g_rnd_path;
+    cfg.blk    = RND_BLK;
+    cfg.secs   = g_rnd_secs;
+    cfg.warmup = RND_WARMUP;
+    cfg.seed   = 0;                 /* из времени/pid */
+
+    rc = dgrndcore(&cfg, rnd_begin, rnd_op, rnd_err, NULL,
+                   &g_rnd_cancel, &res, err, sizeof err);
+
+    pthread_mutex_lock(&g_lock);
+    if (rc != 0) {
+        snprintf(g_rnd_err, sizeof g_rnd_err, "%s", err);
+        g_rnd_failed = 1;
+        memset(&res, 0, sizeof res);
+    } else {
+        g_rnd_failed = 0;
+    }
+    g_rnd_res = res;
+    g_rnd_elapsed_done = (int)(time(NULL) - g_run_t0);
+    g_rnd_done = 1;
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+/* UI-поток: занятость контролов на время прогона */
+static void set_controls_busy(int busy)
+{
+    [g_lin_start setEnabled:!busy];
+    [g_rnd_start setEnabled:!busy];
+    [g_lin_slider setEnabled:!busy];
+    [g_rnd_slider setEnabled:!busy];
+    if (g_lin_dev != NULL) [g_lin_dev setEnabled:!busy];
+    if (g_rnd_dev != NULL) [g_rnd_dev setEnabled:!busy];
+}
+
+static void lin_start(void)
+{
+    pthread_t th;
+
+    if (g_run != 0)
         return;
+
+    pthread_mutex_lock(&g_lock);
+    free(g_lin);
+    g_lin = NULL;
     g_lin_n = 0;
-    g_lin_idx = 0;
-    g_lin_skip = MOCK_CHUNK * (double)(100 - g_duty) / (double)g_duty;
-    g_lin_chunks = (int)(g_cap / (MOCK_CHUNK + g_lin_skip));
-    if (g_lin_chunks < 1)
-        g_lin_chunks = 1;
-    g_lin_feed = g_lin_chunks / 200 + 1;   /* ~50 s на полный проход */
-    g_lin_on = 1;
-    [g_lin_start setEnabled:NO];
-    status_lin();
-}
+    g_lin_total = 0;
+    g_lin_eio = 0;
+    g_lin_idx_done = 0;
+    g_lin_failed = 0;
+    g_lin_err[0] = 0;
+    memset(&g_lin_res, 0, sizeof g_lin_res);
+    pthread_mutex_unlock(&g_lock);
 
-static void mock_lin_stop(void)
-{
-    g_lin_on = 0;
-    [g_lin_start setEnabled:YES];
-    status_lin();
-}
+    g_lin_cancel = 0;
+    g_lin_done = 0;
+    g_run = 1;
+    g_run_t0 = time(NULL);
 
-static void mock_lin_tick(void)
-{
-    int k;
-    for (k = 0; k < g_lin_feed && g_lin_idx < g_lin_chunks; k++, g_lin_idx++) {
-        double off = (double)g_lin_idx * (MOCK_CHUNK + g_lin_skip);
-        if (off + MOCK_CHUNK > g_cap)
-            off = g_cap - MOCK_CHUNK;
-        pts_add(&g_lin, &g_lin_n, off, mock_lin_value(off));
-    }
-    if (g_lin_idx >= g_lin_chunks) {
-        g_lin_on = 0;
-        [g_lin_start setEnabled:YES];
-    }
-    status_lin();
-    [g_lin_view setNeedsDisplay:YES];
-}
+    strncpy(g_lin_path, g_dev, sizeof g_lin_path - 1);
+    g_lin_path[sizeof g_lin_path - 1] = 0;
+    g_lin_duty = g_duty;
 
-static void mock_rnd_start(void)
-{
-    if (g_rnd_on)
+    set_controls_busy(1);
+    status_lin();
+
+    if (pthread_create(&th, NULL, lin_thread, NULL) != 0) {
+        pthread_mutex_lock(&g_lock);
+        snprintf(g_lin_err, sizeof g_lin_err, "не удалось создать поток");
+        g_lin_failed = 1;
+        g_lin_done = 1;
+        pthread_mutex_unlock(&g_lock);
         return;
-    g_rnd_n = 0;
-    g_rnd_elapsed = 0.0;
-    g_rnd_on = 1;
-    [g_rnd_start setEnabled:NO];
-    status_rnd();
-}
-
-static void mock_rnd_stop(void)
-{
-    g_rnd_on = 0;
-    [g_rnd_start setEnabled:YES];
-    status_rnd();
-}
-
-static void mock_rnd_tick(void)
-{
-    int k;
-    int per = (int)(MOCK_OPS_PER_S * TICK_SEC + 0.5);
-    for (k = 0; k < per; k++) {
-        double off = ((double)rand() / (double)RAND_MAX) * g_cap;
-        pts_add(&g_rnd, &g_rnd_n, off, mock_rnd_value());
     }
-    g_rnd_elapsed += TICK_SEC;
-    if (g_rnd_elapsed >= (double)g_rnd_secs)
-        g_rnd_on = 0, [g_rnd_start setEnabled:YES];
+    pthread_detach(th);
+}
+
+static void rnd_start(void)
+{
+    pthread_t th;
+
+    if (g_run != 0)
+        return;
+
+    pthread_mutex_lock(&g_lock);
+    free(g_rnd);
+    g_rnd = NULL;
+    g_rnd_n = 0;
+    g_rnd_failed = 0;
+    g_rnd_err[0] = 0;
+    memset(&g_rnd_res, 0, sizeof g_rnd_res);
+    pthread_mutex_unlock(&g_lock);
+
+    g_rnd_cancel = 0;
+    g_rnd_done = 0;
+    g_run = 2;
+    g_run_t0 = time(NULL);
+
+    strncpy(g_rnd_path, g_dev, sizeof g_rnd_path - 1);
+    g_rnd_path[sizeof g_rnd_path - 1] = 0;
+
+    set_controls_busy(1);
     status_rnd();
-    [g_rnd_view setNeedsDisplay:YES];
+
+    if (pthread_create(&th, NULL, rnd_thread, NULL) != 0) {
+        pthread_mutex_lock(&g_lock);
+        snprintf(g_rnd_err, sizeof g_rnd_err, "не удалось создать поток");
+        g_rnd_failed = 1;
+        g_rnd_done = 1;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    pthread_detach(th);
 }
 
 /* ------------------------------------------------------- рисование */
@@ -411,7 +626,7 @@ static NSDictionary *text_attrs(float size)
     return attrs10;
 }
 
-static NSDictionary *text_attrs_gray(float size)
+static NSDictionary *text_attrs_gray(void)
 {
     static NSDictionary *g9 = NULL;
 
@@ -421,7 +636,6 @@ static NSDictionary *text_attrs_gray(float size)
             [NSColor darkGrayColor],         NSForegroundColorAttributeName,
             NULL] retain];
     }
-    (void)size;
     return g9;
 }
 
@@ -434,7 +648,7 @@ static void draw_text(const char *s, NSPoint p, float size)
 static void draw_text_gray(const char *s, NSPoint p)
 {
     NSString *str = [NSString stringWithUTF8String:s];
-    [str drawAtPoint:p withAttributes:text_attrs_gray(9.0f)];
+    [str drawAtPoint:p withAttributes:text_attrs_gray()];
 }
 
 static float text_width(const char *s, float size)
@@ -481,7 +695,7 @@ static double nice_up(double x)
     return 10.0 * exp;
 }
 
-/* Y-максимум под данные: крпуные деления, запас ~8%, без пустого верха */
+/* Y-максимум под данные: круглые деления, запас ~8%, без пустого верха */
 static double axis_vmax(double raw, int *ndiv)
 {
     double vmax = nice_up(raw * 1.08);
@@ -497,9 +711,9 @@ static double axis_vmax(double raw, int *ndiv)
     return vmax;
 }
 
-/* сетка + оси + подписи X/Y */
+/* рамка, сетка, оси и подписи; cap <= 0 - ёмкость ещё неизвестна */
 static void draw_plot(NSRect pv, double vmax, int ndiv,
-                      int y_ms, const char *ylab)
+                      int y_ms, const char *ylab, double cap)
 {
     float x0 = pv.origin.x, y0 = pv.origin.y;
     float x1 = x0 + pv.size.width, y1 = y0 + pv.size.height;
@@ -508,24 +722,34 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     int   i, gb;
     float t;
 
-    /* сетка */
-    [[NSColor colorWithCalibratedWhite:0.88f alpha:1.0f] set];
-    for (i = 1; i < ndiv; i++) {
-        float y = y0 + ((float)i / (float)ndiv) * pv.size.height;
-        [grid moveToPoint:NSMakePoint(x0, y)];
-        [grid lineToPoint:NSMakePoint(x1, y)];
+    if (cap > 0.0) {
+        [[NSColor colorWithCalibratedWhite:0.88f alpha:1.0f] set];
+        for (i = 1; i < ndiv; i++) {
+            float y = y0 + ((float)i / (float)ndiv) * pv.size.height;
+            [grid moveToPoint:NSMakePoint(x0, y)];
+            [grid lineToPoint:NSMakePoint(x1, y)];
+        }
+        for (gb = 8; gb < 9999; gb += 8) {
+            float x = x0 + (float)((double)gb * 1073741824.0 / cap) *
+                           pv.size.width;
+            if (x >= x1) break;
+            [grid moveToPoint:NSMakePoint(x, y0)];
+            [grid lineToPoint:NSMakePoint(x, y1)];
+        }
+        [grid setLineWidth:1.0f];
+        [grid stroke];
+    } else {
+        [[NSColor colorWithCalibratedWhite:0.88f alpha:1.0f] set];
+        for (i = 1; i < ndiv; i++) {
+            float y = y0 + ((float)i / (float)ndiv) * pv.size.height;
+            [grid moveToPoint:NSMakePoint(x0, y)];
+            [grid lineToPoint:NSMakePoint(x1, y)];
+        }
+        [grid setLineWidth:1.0f];
+        [grid stroke];
     }
-    for (gb = 8; gb < 9999; gb += 8) {
-        float x = x0 + (float)((double)gb * 1073741824.0 / g_cap) *
-                       pv.size.width;
-        if (x >= x1) break;
-        [grid moveToPoint:NSMakePoint(x, y0)];
-        [grid lineToPoint:NSMakePoint(x, y1)];
-    }
-    [grid setLineWidth:1.0f];
-    [grid stroke];
 
-    /* рамка графика: правый/верхний край видны */
+    /* рамка графика */
     [[NSColor colorWithCalibratedWhite:0.78f alpha:1.0f] set];
     [axes moveToPoint:NSMakePoint(x0, y0)];
     [axes lineToPoint:NSMakePoint(x1, y0)];
@@ -535,25 +759,25 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     [axes setLineWidth:1.0f];
     [axes stroke];
 
-    /* деления X и подписи GB */
     [[NSColor blackColor] set];
-    for (gb = 0; gb < 9999; gb += 8) {
-        float x = x0 + (float)((double)gb * 1073741824.0 / g_cap) *
-                       pv.size.width;
-        char  lbl[24];
-        NSBezierPath *tick;
-        if (x > x1) break;
-        tick = [NSBezierPath bezierPath];
-        [tick moveToPoint:NSMakePoint(x, y0)];
-        [tick lineToPoint:NSMakePoint(x, y0 - 4.0f)];
-        [tick stroke];
-        snprintf(lbl, sizeof lbl, "%d", gb);
-        draw_text(lbl,
-                  NSMakePoint(x - text_width(lbl, 9.0f) * 0.5f,
-                              y0 - 14.0f), 9.0f);
+    if (cap > 0.0) {
+        for (gb = 0; gb < 9999; gb += 8) {
+            float x = x0 + (float)((double)gb * 1073741824.0 / cap) *
+                           pv.size.width;
+            char  lbl[24];
+            NSBezierPath *tick;
+            if (x > x1) break;
+            tick = [NSBezierPath bezierPath];
+            [tick moveToPoint:NSMakePoint(x, y0)];
+            [tick lineToPoint:NSMakePoint(x, y0 - 4.0f)];
+            [tick stroke];
+            snprintf(lbl, sizeof lbl, "%d", gb);
+            draw_text(lbl,
+                      NSMakePoint(x - text_width(lbl, 9.0f) * 0.5f,
+                                  y0 - 14.0f), 9.0f);
+        }
     }
 
-    /* деления Y и подписи значений */
     for (t = 0.0f; t <= (float)ndiv; t += 1.0f) {
         float y   = y0 + (t / (float)ndiv) * pv.size.height;
         double val = vmax * ((double)t / (double)ndiv);
@@ -572,7 +796,6 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
                               y - 4.0f), 9.0f);
     }
 
-    /* подписи осей: X - что и в чём, Y - единица */
     {
         const char *xlab = "поверхность диска, GB";
         draw_text_gray(xlab,
@@ -593,7 +816,7 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     float  padl = 56.0f, padr = 18.0f, padt = 26.0f, padb = 40.0f;
     NSRect pv;
     NSBezierPath *bp;
-    double raw = 0.0, vmax;
+    double raw = 0.0, vmax, cap;
     int    ndiv = 4, i;
 
     (void)dirty;
@@ -604,40 +827,40 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
                     NSWidth(f) - padl - padr,
                     NSHeight(f) - padt - padb);
 
+    pthread_mutex_lock(&g_lock);
     for (i = 0; i < g_lin_n; i++)
         if (g_lin[i].val > raw)
             raw = g_lin[i].val;
     vmax = (raw > 0.0) ? axis_vmax(raw, &ndiv) : 40.0;
+    cap = g_cap;
 
-    draw_plot(pv, vmax, ndiv, 0, "MB/s");
+    draw_plot(pv, vmax, ndiv, 0, "MB/s", cap);
 
-    if (g_lin_n == 0)
-        return;
-
-    /* метка текущей позиции прохода */
-    {
+    if (g_lin_n > 0) {
         float mx = pv.origin.x +
-                   (float)(g_lin[g_lin_n - 1].off / g_cap) * pv.size.width;
+                   (float)(g_lin[g_lin_n - 1].off / cap) * pv.size.width;
+
         [[NSColor colorWithCalibratedWhite:0.65f alpha:1.0f] set];
         [NSBezierPath strokeLineFromPoint:NSMakePoint(mx, pv.origin.y)
                                   toPoint:NSMakePoint(mx, pv.origin.y +
                                                       pv.size.height)];
-    }
 
-    bp = [[NSBezierPath bezierPath] retain];
-    [[NSColor blueColor] set];
-    [bp setLineWidth:1.4f];
-    for (i = 0; i < g_lin_n; i++) {
-        NSPoint p = NSMakePoint(
-            pv.origin.x + (float)(g_lin[i].off / g_cap) * pv.size.width,
-            pv.origin.y + (float)(g_lin[i].val / vmax) * pv.size.height);
-        if (i == 0)
-            [bp moveToPoint:p];
-        else
-            [bp lineToPoint:p];
+        bp = [[NSBezierPath bezierPath] retain];
+        [[NSColor blueColor] set];
+        [bp setLineWidth:1.4f];
+        for (i = 0; i < g_lin_n; i++) {
+            NSPoint p = NSMakePoint(
+                pv.origin.x + (float)(g_lin[i].off / cap) * pv.size.width,
+                pv.origin.y + (float)(g_lin[i].val / vmax) * pv.size.height);
+            if (i == 0)
+                [bp moveToPoint:p];
+            else
+                [bp lineToPoint:p];
+        }
+        [bp stroke];
+        [bp release];
     }
-    [bp stroke];
-    [bp release];
+    pthread_mutex_unlock(&g_lock);
 }
 
 - (void)dealloc
@@ -657,7 +880,7 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     NSRect f = [self bounds];
     float  padl = 56.0f, padr = 18.0f, padt = 26.0f, padb = 40.0f;
     NSRect pv;
-    double raw = 0.0, vmax, thr;
+    double raw = 0.0, vmax, cap, thr = 1e30;
     int    ndiv = 5, i;
 
     (void)dirty;
@@ -668,29 +891,31 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
                     NSWidth(f) - padl - padr,
                     NSHeight(f) - padt - padb);
 
+    pthread_mutex_lock(&g_lock);
     for (i = 0; i < g_rnd_n; i++)
         if (g_rnd[i].val > raw)
             raw = g_rnd[i].val;
-    vmax = (raw > 0.0) ? axis_vmax(raw, &ndiv) : 50.0;
+    vmax = (raw > 0.0) ? axis_vmax(raw, &ndiv) : 50000.0;   /* µs */
+    cap = g_cap;
 
-    draw_plot(pv, vmax, ndiv, 1, "ms");
+    draw_plot(pv, vmax, ndiv, 1, "ms", cap);
 
-    if (g_rnd_n == 0)
-        return;
-
-    /* спайки (хвост выше p99) - красным, остальное - чёрным */
-    thr = (g_rnd_n >= 100) ? pctl_of(g_rnd, g_rnd_n, 0.99) : 1e30;
-    for (i = 0; i < g_rnd_n; i++) {
-        float x = pv.origin.x +
-                  (float)(g_rnd[i].off / g_cap) * pv.size.width;
-        float y = pv.origin.y +
-                  (float)(g_rnd[i].val / vmax) * pv.size.height;
-        if (g_rnd[i].val > thr)
-            [[NSColor redColor] set];
-        else
-            [[NSColor blackColor] set];
-        NSRectFill(NSMakeRect(x - 1.5f, y - 1.5f, 3.0f, 3.0f));
+    if (g_rnd_n > 0) {
+        if (g_rnd_n >= 100)
+            thr = pctl_of(g_rnd, g_rnd_n, 0.99);
+        for (i = 0; i < g_rnd_n; i++) {
+            float x = pv.origin.x +
+                      (float)(g_rnd[i].off / cap) * pv.size.width;
+            float y = pv.origin.y +
+                      (float)(g_rnd[i].val / vmax) * pv.size.height;
+            if (g_rnd[i].val > thr)
+                [[NSColor redColor] set];
+            else
+                [[NSColor blackColor] set];
+            NSRectFill(NSMakeRect(x - 1.5f, y - 1.5f, 3.0f, 3.0f));
+        }
     }
+    pthread_mutex_unlock(&g_lock);
 }
 
 - (void)dealloc
@@ -711,9 +936,9 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
 - (void)secsChanged:(id)s;
 - (void)devChanged:(id)s;
 - (void)appActive:(NSNotification *)n;
+- (void)windowDidResize:(NSNotification *)n;
 - (void)tick:(NSTimer *)timer;
 - (void)quit:(id)s;
-- (void)windowDidResize:(NSNotification *)n;
 @end
 
 @implementation Controller
@@ -743,25 +968,31 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
 - (void)linStart:(id)s
 {
     (void)s;
-    mock_lin_start();
+    lin_start();
 }
 
 - (void)linStop:(id)s
 {
     (void)s;
-    mock_lin_stop();
+    if (g_run == 1) {
+        g_lin_cancel = 1;
+        status_lin();
+    }
 }
 
 - (void)rndStart:(id)s
 {
     (void)s;
-    mock_rnd_start();
+    rnd_start();
 }
 
 - (void)rndStop:(id)s
 {
     (void)s;
-    mock_rnd_stop();
+    if (g_run == 2) {
+        g_rnd_cancel = 1;
+        status_rnd();
+    }
 }
 
 - (void)dutyChanged:(id)s
@@ -770,7 +1001,7 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     g_duty = [s intValue];
     snprintf(lbl, sizeof lbl, "%d%%", g_duty);
     [g_duty_val setStringValue:[NSString stringWithUTF8String:lbl]];
-    if (!g_lin_on)
+    if (g_run == 0)
         status_lin();
 }
 
@@ -780,7 +1011,7 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
     g_rnd_secs = [s intValue];
     snprintf(lbl, sizeof lbl, "%d s", g_rnd_secs);
     [g_secs_val setStringValue:[NSString stringWithUTF8String:lbl]];
-    if (!g_rnd_on)
+    if (g_run == 0)
         status_rnd();
 }
 
@@ -799,6 +1030,14 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
 
     strncpy(g_dev, u, sizeof g_dev - 1);
     g_dev[sizeof g_dev - 1] = 0;
+
+    {
+        double c = probe_capacity(g_dev);
+        if (c > 0.0)
+            g_cap = c;
+    }
+    [g_lin_view setNeedsDisplay:YES];
+    [g_rnd_view setNeedsDisplay:YES];
 
     other = (s == g_lin_dev) ? g_rnd_dev : g_lin_dev;
     if (other != NULL) {
@@ -837,11 +1076,50 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
 
 - (void)tick:(NSTimer *)timer
 {
+    int ldone, rdone;
+
     (void)timer;
-    if (g_lin_on)
-        mock_lin_tick();
-    if (g_rnd_on)
-        mock_rnd_tick();
+
+    pthread_mutex_lock(&g_lock);
+    ldone = g_lin_done;
+    rdone = g_rnd_done;
+    pthread_mutex_unlock(&g_lock);
+
+    if (g_run == 1 && ldone) {
+        g_run = 0;
+        g_lin_done = 0;
+        set_controls_busy(0);
+        if (g_again) {
+            g_again = 0;
+            printf("again: restart linear\n");
+            fflush(stdout);
+            lin_start();
+        }
+    }
+    if (g_run == 2 && rdone) {
+        g_run = 0;
+        g_rnd_done = 0;
+        set_controls_busy(0);
+        if (g_again) {
+            g_again = 0;
+            printf("again: restart random\n");
+            fflush(stdout);
+            rnd_start();
+        }
+    }
+
+    if (g_stop_at > 0 && time(NULL) >= g_stop_at) {
+        g_stop_at = 0;
+        if (g_run == 1)
+            g_lin_cancel = 1;
+        if (g_run == 2)
+            g_rnd_cancel = 1;
+    }
+
+    status_lin();
+    status_rnd();
+    [g_lin_view setNeedsDisplay:YES];
+    [g_rnd_view setNeedsDisplay:YES];
 
     if (g_cycle) {
         g_cycle_ticks++;
@@ -850,11 +1128,11 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
                                 [g_tabs selectedTabViewItem]];
             int nxt = (cur == 0) ? 1 : 0;
             [g_tabs selectTabViewItemAtIndex:nxt];
+            pthread_mutex_lock(&g_lock);
             printf("cycle: tab %d -> %d   lin_n %d   rnd_n %d\n",
                    cur, nxt, g_lin_n, g_rnd_n);
             fflush(stdout);
-            [g_lin_view setNeedsDisplay:YES];
-            [g_rnd_view setNeedsDisplay:YES];
+            pthread_mutex_unlock(&g_lock);
         }
     }
 }
@@ -862,6 +1140,9 @@ static void draw_plot(NSRect pv, double vmax, int ndiv,
 - (void)quit:(id)s
 {
     (void)s;
+    g_lin_cancel = 1;
+    g_rnd_cancel = 1;
+    usleep(200000);
     [NSApp terminate:nil];
 }
 
@@ -894,14 +1175,13 @@ static NSPopUpButton *make_dev_popup(NSView *v, Controller *ctl,
     [pop setAutoresizingMask:NSViewMinYMargin];
     [v addSubview:pop];
     fill_dev_popup(pop);
-    return [pop autorelease];   /* живёт в супервью, указатель остаётся валидным */
+    return [pop autorelease];
 }
 
 static NSView *make_lin_tab(Controller *ctl, NSSize sz)
 {
     NSView *v = [[NSView alloc] initWithFrame:
         NSMakeRect(0.0f, 0.0f, sz.width, sz.height)];
-    NSSlider *sl;
     NSButton *b;
     float     h = sz.height, w = sz.width;
     float     y = h - 34.0f;
@@ -910,16 +1190,15 @@ static NSView *make_lin_tab(Controller *ctl, NSSize sz)
     g_lin_dev = make_dev_popup(v, ctl, 50.0f, y - 2.0f, 168.0f);
 
     make_label(v, "duty", 234.0f, y + 3.0f, 36.0f);
-    sl = [[NSSlider alloc] initWithFrame:NSMakeRect(272.0f, y - 4.0f,
-                                                    180.0f, 24.0f)];
-    [sl setMinValue:10.0];
-    [sl setMaxValue:100.0];
-    [sl setIntValue:g_duty];
-    [sl setTarget:ctl];
-    [sl setAction:@selector(dutyChanged:)];
-    [sl setAutoresizingMask:NSViewMinYMargin];
-    [v addSubview:sl];
-    [sl release];
+    g_lin_slider = [[NSSlider alloc] initWithFrame:
+        NSMakeRect(272.0f, y - 4.0f, 180.0f, 24.0f)];
+    [g_lin_slider setMinValue:10.0];
+    [g_lin_slider setMaxValue:100.0];
+    [g_lin_slider setIntValue:g_duty];
+    [g_lin_slider setTarget:ctl];
+    [g_lin_slider setAction:@selector(dutyChanged:)];
+    [g_lin_slider setAutoresizingMask:NSViewMinYMargin];
+    [v addSubview:g_lin_slider];
 
     g_duty_val = make_label(v, "10%", 458.0f, y + 3.0f, 56.0f);
 
@@ -965,7 +1244,6 @@ static NSView *make_rnd_tab(Controller *ctl, NSSize sz)
 {
     NSView *v = [[NSView alloc] initWithFrame:
         NSMakeRect(0.0f, 0.0f, sz.width, sz.height)];
-    NSSlider *sl;
     NSButton *b;
     float     h = sz.height, w = sz.width;
     float     y = h - 34.0f;
@@ -974,16 +1252,15 @@ static NSView *make_rnd_tab(Controller *ctl, NSSize sz)
     g_rnd_dev = make_dev_popup(v, ctl, 50.0f, y - 2.0f, 168.0f);
 
     make_label(v, "секунд", 234.0f, y + 3.0f, 52.0f);
-    sl = [[NSSlider alloc] initWithFrame:NSMakeRect(290.0f, y - 4.0f,
-                                                    162.0f, 24.0f)];
-    [sl setMinValue:5.0];
-    [sl setMaxValue:120.0];
-    [sl setIntValue:g_rnd_secs];
-    [sl setTarget:ctl];
-    [sl setAction:@selector(secsChanged:)];
-    [sl setAutoresizingMask:NSViewMinYMargin];
-    [v addSubview:sl];
-    [sl release];
+    g_rnd_slider = [[NSSlider alloc] initWithFrame:
+        NSMakeRect(290.0f, y - 4.0f, 162.0f, 24.0f)];
+    [g_rnd_slider setMinValue:5.0];
+    [g_rnd_slider setMaxValue:120.0];
+    [g_rnd_slider setIntValue:g_rnd_secs];
+    [g_rnd_slider setTarget:ctl];
+    [g_rnd_slider setAction:@selector(secsChanged:)];
+    [g_rnd_slider setAutoresizingMask:NSViewMinYMargin];
+    [v addSubview:g_rnd_slider];
 
     g_secs_val = make_label(v, "30 s", 458.0f, y + 3.0f, 56.0f);
 
@@ -1056,7 +1333,6 @@ int main(int argc, char *argv[])
 
     (void)argc;
     (void)argv;
-    srand((unsigned)time(NULL));
 
     /* dev-хук: -w N -h N задают стартовый размер (проверка раскладки) */
     {
@@ -1103,7 +1379,7 @@ int main(int argc, char *argv[])
              backing:NSBackingStoreBuffered
              defer:NO];
     [win setTitle:[NSString stringWithUTF8String:
-                    "DiskGraph - UI mock (Linear / Random)"]];
+                    "DiskGraph - linear / random read test"]];
     [win setMinSize:NSMakeSize(760.0f, 560.0f)];
     [win setDelegate:ctl];
     root = [[[NSView alloc] initWithFrame:rc] autorelease];
@@ -1131,7 +1407,14 @@ int main(int argc, char *argv[])
 
     sync_tabs_layout();
 
-    /* dev-хук для скриншотов: -lin / -rnd автостартуют мок и вкладку */
+    {
+        double c = probe_capacity(g_dev);
+        if (c > 0.0)
+            g_cap = c;
+    }
+
+    /* dev-хуки: -lin / -rnd стартуют реальный прогон, -cycle щёлкает
+     * вкладки и печатает счётчики, -devs печатает список дисков */
     {
         NSArray *args = [[NSProcessInfo processInfo] arguments];
         int i;
@@ -1139,14 +1422,18 @@ int main(int argc, char *argv[])
             NSString *a = [args objectAtIndex:i];
             if ([a isEqualToString:@"-lin"]) {
                 [g_tabs selectTabViewItemAtIndex:0];
-                mock_lin_start();
+                lin_start();
             } else if ([a isEqualToString:@"-rnd"]) {
                 [g_tabs selectTabViewItemAtIndex:1];
-                mock_rnd_start();
+                rnd_start();
+            } else if ([a isEqualToString:@"-stop"] && i + 1 < [args count]) {
+                g_stop_at = time(NULL) + [[args objectAtIndex:i + 1] intValue];
+                i++;
+            } else if ([a isEqualToString:@"-again"]) {
+                g_again = 1;
             } else if ([a isEqualToString:@"-cycle"]) {
-                g_cycle = 1;      /* оба мока + авто-щёлканье вкладок */
-                mock_lin_start();
-                mock_rnd_start();
+                g_cycle = 1;
+                lin_start();
             } else if ([a isEqualToString:@"-devs"]) {
                 NSArray *dl = scan_disks();
                 int k;
