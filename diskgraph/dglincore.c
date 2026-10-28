@@ -1,9 +1,12 @@
 /*
  * dglincore.c - линейный пунктирный проход по диску как ФУНКЦИЯ
  *
- * Вынуто из dblin.c без изменения логики: сегменты стартуют
- * эквидистантно от LBA0, шаг = seg*(100-duty)/duty, внутри сегмента
- * блоки таймятся по отдельности и XOR-ятся (анти-оптимизатор).
+ * Раскладка сегментов: duty 100 - сплошной проход; иначе N сегментов
+ * равномерно от LBA0 до САМОГО КОНЦА диска (первый с 0, последний
+ * кончается на ёмкости), N = round(ёмкость * duty / seg). Раньше шаг
+ * seg*100/duty шёл от LBA0 и хвост короче шага не читался - при duty 1%
+ * до 3 GB белого в конце графика. Внутри сегмента блоки таймятся по
+ * отдельности и XOR-ятся (анти-оптимизатор).
  * Наружу - калбеки: begin (геометрия/план), seg (итог сегмента),
  * err (ошибка блока). Никакого stdout.
  */
@@ -18,6 +21,51 @@
 
 #define SECT 512ULL
 
+/* ------------------------------------------------------------ plan */
+
+typedef struct {
+    uint64_t n;          /* сегментов              */
+    uint64_t seg;        /* длина сегмента         */
+    uint64_t span;       /* maxoff - seg (dashed)  */
+    uint64_t maxoff;
+    int      solid;
+} linplan;
+
+static void plan_make(linplan *p, uint64_t maxoff, uint64_t seg, int duty)
+{
+    uint64_t nmax;
+
+    memset(p, 0, sizeof *p);
+    p->seg    = seg;
+    p->maxoff = maxoff;
+
+    if (duty >= 100 || maxoff <= seg) {
+        p->solid = 1;
+        p->n = (maxoff + seg - 1) / seg;      /* последний - хвост */
+        return;
+    }
+    p->n = (maxoff * (uint64_t)duty / 100 + seg / 2) / seg;
+    if (p->n < 2)
+        p->n = 2;
+    nmax = maxoff / seg;                      /* больше - сегменты слипнутся */
+    if (p->n > nmax)
+        p->n = nmax;
+    p->span = maxoff - seg;
+}
+
+/* старт сегмента k: равномерно от 0 до maxoff - seg, по сектору */
+static uint64_t plan_off(const linplan *p, uint64_t k)
+{
+    uint64_t o;
+
+    if (p->solid)
+        return k * p->seg;
+    if (p->n < 2)
+        return 0;
+    o = p->span * k / (p->n - 1);
+    return o - (o % SECT);                    /* EINVAL on rdisk otherwise */
+}
+
 /* ------------------------------------------------------------ core */
 
 int dglincore(const dglincfg *cfg,
@@ -30,7 +78,8 @@ int dglincore(const dglincfg *cfg,
               char *errbuf, size_t errlen)
 {
     int      fd = -1;
-    uint64_t seg, blk, cap, maxoff, skip, off;
+    uint64_t seg, blk, cap, maxoff, off, k;
+    linplan  plan;
     char    *buf = NULL;
     int      rc = -1;
     dglininfo info;
@@ -69,25 +118,17 @@ int dglincore(const dglincfg *cfg,
     maxoff = (cfg->extent == 0 || cfg->extent > cap) ? cap : cfg->extent;
     maxoff -= maxoff % SECT;
 
-    skip = seg * (uint64_t)(100 - cfg->duty) / (uint64_t)cfg->duty;
-    skip -= skip % SECT;              /* EINVAL on rdisk otherwise */
+    plan_make(&plan, maxoff, seg, cfg->duty);
 
     info.capacity = cap;
     info.extent   = maxoff;
-    info.skip     = skip;
-
-    {
-        uint64_t o, n = 0;
-        for (o = 0; o < maxoff; o += seg + skip) {
-            uint64_t seglen = seg;
-            if (o + seglen > maxoff)
-                seglen = maxoff - o;
-            if (seglen < blk)
-                break;
-            n++;
-        }
-        info.chunks = n;
-    }
+    info.skip     = (!plan.solid && plan.n > 1)
+                    ? plan.span / (plan.n - 1) - seg : 0;
+    info.chunks   = plan.n;
+    /* сплошной проход: хвост короче блока не мерим */
+    if (plan.solid && plan.n > 0 &&
+        maxoff - plan_off(&plan, plan.n - 1) < blk)
+        info.chunks--;
 
     if (on_begin != NULL)
         on_begin(ctx, &info);
@@ -107,7 +148,7 @@ int dglincore(const dglincfg *cfg,
                 break;
     }
 
-    for (off = 0; off < maxoff; off += seg + skip) {
+    for (k = 0; k < info.chunks; k++) {
         uint64_t seglen = seg;
         uint64_t pos;
         uint64_t c_bytes = 0, c_time = 0, c_blocks = 0, c_eio = 0;
@@ -116,6 +157,7 @@ int dglincore(const dglincfg *cfg,
         if (cancel != NULL && *cancel)
             break;
 
+        off = plan_off(&plan, k);
         if (off + seglen > maxoff)
             seglen = maxoff - off;
         if (seglen < blk)
@@ -166,6 +208,7 @@ int dglincore(const dglincfg *cfg,
             dglinseg s;
             s.index   = res->chunks;
             s.off     = off;
+            s.len     = seglen;
             s.bytes   = c_bytes;
             s.time_us = c_time;
             s.blocks  = c_blocks;

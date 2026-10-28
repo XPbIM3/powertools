@@ -1424,7 +1424,9 @@ static void lin_seg(void *ctx, const dglinseg *seg)
 {
     (void)ctx;
     pthread_mutex_lock(&g_lock);
-    pts_add(&g_lin, (double)seg->off, mbs_of(seg->bytes, seg->time_us), 0);
+    /* точка - в середине сегмента: кривая от начала до конца диска */
+    pts_add(&g_lin, (double)seg->off + (double)seg->len * 0.5,
+            mbs_of(seg->bytes, seg->time_us), 0);
     g_lin_bytes   += seg->bytes;
     g_lin_time_us += seg->time_us;
     g_lin_idx_done = (int)(seg->index + 1);
@@ -2775,6 +2777,14 @@ int main(int argc, char *argv[])
             lin_sel_changed();
         } else if (strcmp(argv[i], "-adev") == 0) {
             t = &g_acc;
+        } else if (strcmp(argv[i], "-duty") == 0) {
+            char lbl[16];
+            g_duty = atoi(argv[i + 1]);
+            if (g_duty < 1) g_duty = 1;
+            if (g_duty > 100) g_duty = 100;
+            [g_lin_slider setIntValue:g_duty];
+            snprintf(lbl, sizeof lbl, "%d %%", g_duty);
+            [g_duty_val setStringValue:u8(lbl)];
         } else if (strcmp(argv[i], "-smdev") == 0) {
             snprintf(g_sm_sel, sizeof g_sm_sel, "%s", argv[i + 1]);
         } else if (strcmp(argv[i], "-sdev") == 0) {
