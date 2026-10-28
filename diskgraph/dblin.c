@@ -18,7 +18,11 @@
  *   - прогрев спин-апа: 2 блока в момент старта, в данные НЕ идут.
  *
  * stdout - единственный выходной канал, человекочитаемый:
- *   шапка, строка на каждый I/O, строки ошибок, финальная сводка "---".
+ *   шапка, ОДНА строка на сегмент со средней скоростью этого участка
+ *   поверхности (тайминги-делэй наружу не выводим - тулза только про
+ *   скорость линейного чтения), строки ошибок E, финальная сводка "---".
+ *   Блоки внутри сегмента таймятся и XOR-ятся честно (для расчёта
+ *   средней и против оптимизатора) - наружу НЕ печатаются.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,18 +103,6 @@ static void fmt_gb(uint64_t off, char *out, size_t outsz)
     snprintf(out, outsz, "%7.2f", (double)off / 1073741824.0);
 }
 
-static void fmt_ms(uint64_t us, char *out, size_t outsz)
-{   /* человеческий лаг: s / ms / us */
-    if (us >= 1000000)
-        snprintf(out, outsz, "%.2f s", (double)us / 1e6);
-    else if (us >= 10000)
-        snprintf(out, outsz, "%.1f ms", (double)us / 1e3);
-    else if (us >= 1000)
-        snprintf(out, outsz, "%.2f ms", (double)us / 1e3);
-    else
-        snprintf(out, outsz, "%.0f us", (double)us);
-}
-
 static uint64_t align_sect(uint64_t v, const char *name)
 {
     uint64_t a = v - (v % SECT);
@@ -163,6 +155,7 @@ int main(int argc, char **argv)
     uint64_t cap, skip, off, t;
     uint32_t bs = 512;
     uint64_t points = 0, bytes_ok = 0, eio = 0, t_all = 0;
+    uint64_t nchunks = 0;
     char    *buf;
     time_t   t0wall;
     struct sigaction sa;
@@ -256,10 +249,16 @@ int main(int argc, char **argv)
 
     t0wall = time(NULL);
 
-    /* ---- сам проход: чанки эквидистантно, блоки внутри чанков ---- */
+    /* ---- сам проход: чанки эквидистантно; блоки таймятся и XOR-ятся
+     * внутри (честность-канон), наружу - одна строка на сегмент и E
+     * при ошибках ---- */
     for (off = 0; off < maxoff && !g_stop; off += seg + skip) {
         uint64_t seglen = seg;
         uint64_t pos;
+        uint64_t c_bytes = 0, c_time = 0, c_blocks = 0, c_eio = 0;
+        int      media_end = 0;
+        char     gb[24], mb[24];
+
         if (off + seglen > maxoff)
             seglen = maxoff - off;
         if (seglen < blk)
@@ -271,7 +270,6 @@ int main(int argc, char **argv)
             uint64_t t0, dt;
             uint32_t i;
             uint8_t  cs = 0;
-            char     gb[24], ms[24];
 
             if (chunk > blk) chunk = blk;
 
@@ -285,25 +283,43 @@ int main(int argc, char **argv)
                 printf("E %s G          (errno %ld)\n", gb, (long)errno);
                 fflush(stdout);
                 eio++;
+                c_eio++;
                 continue;
             }
-            if (r == 0)
-                break;                   /* край носителя раньше данных */
+            if (r == 0) {
+                media_end = 1;           /* край носителя */
+                break;
+            }
 
             for (i = 0; i < (uint32_t)r; i++)      /* анти-оптимизатор */
                 cs ^= buf[i];
             (void)cs;
 
-            fmt_gb(off + pos, gb, sizeof gb);
-            fmt_ms(dt, ms, sizeof ms);
-            printf("L %s G %5.2f M %8s %6.1f MB/s\n",
-                   gb, (double)r / 1048576.0, ms,
-                   (double)r / ((double)dt / 1e6) / 1048576.0);
-            fflush(stdout);              /* живой человекочитаемый поток */
-
-            points++;
-            bytes_ok += (uint64_t)r;
+            c_time += dt;
+            c_bytes += (uint64_t)r;
+            c_blocks++;
         }
+
+        /* строка сегмента: старт участка, его объём, средняя скорость */
+        fmt_gb(off, gb, sizeof gb);
+        snprintf(mb, sizeof mb, "%6.2f", (double)c_bytes / 1048576.0);
+        printf("C %s G %s M %6.1f MB/s  blk %" PRIu64,
+               gb, mb,
+               c_time > 0
+                   ? (double)c_bytes / ((double)c_time / 1e6) / 1048576.0
+                   : 0.0,
+               c_blocks);
+        if (c_eio > 0)
+            printf("  eio %" PRIu64, c_eio);
+        printf("\n");
+        fflush(stdout);
+
+        points += c_blocks;
+        bytes_ok += c_bytes;
+        nchunks++;
+
+        if (media_end)
+            break;                       /* дальше носителя не читаем */
     }
 
     free(buf);
@@ -314,9 +330,10 @@ int main(int argc, char **argv)
             ? (double)bytes_ok / ((double)t_all / 1e6) / 1048576.0 : 0.0;
         int mins = (int)(time(NULL) - t0wall) / 60;
         int secs = (int)(time(NULL) - t0wall) % 60;
-        printf("---  points %" PRIu64 "  avg %.1f MB/s  eio %" PRIu64
-               "%s  time %d:%02d\n",
-               points, mbs, eio, g_stop ? "  [stopped]" : "", mins, secs);
+        printf("---  chunks %" PRIu64 "  blocks %" PRIu64 "  avg %.1f MB/s"
+               "  eio %" PRIu64 "%s  time %d:%02d\n",
+               nchunks, points, mbs, eio, g_stop ? "  [stopped]" : "",
+               mins, secs);
         fflush(stdout);
     }
     return 0;
