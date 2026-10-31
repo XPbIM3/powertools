@@ -13,10 +13,20 @@ RND         = dbrnd
 PROBE       = graphprobe
 APP         = GraphProbe.app
 APP2        = DiskGraph.app
-APPFLAGS    = $(CFLAGS) $(TARGET_FLAGS) -fobjc-abi-version=1 \
+APPFLAGS    = -static-libgcc $(CFLAGS) $(TARGET_FLAGS) -fobjc-abi-version=1 \
               -x objective-c \
               -framework Foundation -framework AppKit -framework Security \
               -framework IOKit
+# GCC-рантайм для ObjC: драйвер gcc вместе с crt3.o ставит -lgcc_s.10.4, то
+# есть динамический /usr/lib/libgcc_s.1.dylib. На Tiger-тулчейне это дефолт
+# для ObjC, но на Jaguar 10.2 этой библиотеки НЕТ (появилась 10.3.9+):
+# dyld отказался грузить diskgraph "can't open library" (ловили 31.10.2026,
+# фиаско Jaguar-прогона). Чистый C (dblin/dbsweep) этого не получает и
+# грузится чисто. Только у ObjC-бинарей, кроме того, тянутся хелперы
+# 64-битной математики (__udivdi3 __umoddi3 __cmpdi2 __floatdidf
+# __fixunsdfdi), живущие в libgcc_s; -static-libgcc выключает это
+# динамическое звено и втачивает helpers статически.
+# Проверено darwin9-gcc (leopard-кросс), 31.10.2026.
 
 all: $(TARGET) $(LIN) $(RND) $(APP) $(APP2)
 
