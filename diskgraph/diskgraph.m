@@ -23,8 +23,11 @@
  * мьютексом и рисует уже без него - замер не ждёт отрисовку.
  * Одновременно идёт один прогон.
  *
- * Вкладки независимы: у каждой свой диск, своя ёмкость оси X и свои
- * данные; переключение вкладок данные не трогает.
+ * Выбор диска - глобальный, в шапке окна над вкладками (на вкладках
+ * своих селекторов нет, замер всегда /dev/rdiskN выбранного диска).
+ * Данные по-дисковые: devdata с именем "diskN" хранит результаты всех
+ * трёх замеров; выбрали диск - вкладки показывают его данные, у диска
+ * без замеров вкладки пусты; вернулись - данные не забыты.
  *
  * Права: чтение /dev/rdiskN требует root. При запуске приложение само
  * перезапускает себя через AuthorizationExecuteWithPrivileges (пароль
@@ -60,7 +63,7 @@
 #define TICK_SEC 0.25
 
 #define WIN_W 1000.0f
-#define WIN_H  720.0f
+#define WIN_H  750.0f
 
 #define GIB 1073741824.0
 #define SEEK_XMIN 4096.0           /* левый край лог-оси хопов */
@@ -89,28 +92,79 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_run = RUN_IDLE;            /* UI-поток */
 static time_t g_run_t0 = 0;             /* UI-поток */
 
-/* ---- Sequential read (под g_lock, кроме помеченного) ---- */
-static dbuf g_lin = { NULL, 0, 0 };
-static dbuf g_lin_errs = { NULL, 0, 0 };    /* x = позиция EIO-блока */
-static volatile int g_lin_cancel = 0;
-static int  g_lin_done = 0;
-static int  g_lin_failed = 0;
-static int  g_lin_oserr = 0;
-static char g_lin_err[256] = "";
-static dglinresult g_lin_res;
-static uint64_t g_lin_total = 0;        /* сегментов в плане */
-static uint64_t g_lin_bytes = 0;        /* суммы для живого avg */
-static uint64_t g_lin_time_us = 0;
-static int      g_lin_idx_done = 0;     /* сегментов завершено */
-static int      g_lin_elapsed = 0;      /* длительность прогона, с */
-static double   g_lin_datacap = 0.0;    /* ёмкость прочитанного диска */
+/* ---- данные по диску: стейт-машина «выбранный диск» ----
+ *
+ * Результаты замеров живут в devdata диска ("diskN"), а не в вкладках.
+ * Выбор в шапке переключает, какие данные показывают вкладки; при
+ * возврате к диску показывается то, что осталось от прошлых прогонов.
+ *
+ * Данные ядер замеров - под g_lock (кроме помеченного); вкладки,
+ * шапка и записи дисков - только UI-поток.
+ */
 
-/* UI-поток */
-static char   g_lin_sel[64] = "/dev/rdisk0";
-static double g_lin_selcap = 0.0;
-static char   g_lin_path[64] = "";      /* снимок на Старт */
-static int    g_lin_duty = 5;
-static int    g_duty = 5;
+typedef struct {                        /* Sequential read              */
+    dbuf        pts, errs;              /* EIO: x = позиция блока       */
+    volatile int cancel;
+    int         done, failed, oserr, elapsed, idx_done, duty;
+    char        err[256], path[64];     /* path - нода снимка на Старт  */
+    dglinresult res;
+    uint64_t    total, bytes, time_us;
+} dlin;
+
+typedef struct {                        /* Access map / Seek profile    */
+    dbuf        pts, errs;
+    volatile int cancel;
+    int         done, failed, oserr, elapsed;
+    char        err[256];
+    dgrndresult res;
+    double      med, p99;
+    double      short_med, long_med;    /* seek: <1 MB и > 1/2 диска    */
+    int         stat_n;                 /* по скольким точкам посчитано */
+    int         bn[NBIN];
+    double      bmed[NBIN], blo[NBIN];
+} drnd;
+
+typedef struct {
+    char        name[16];               /* "disk0" - ключ               */
+    int         used;
+    double      cap;                    /* ёмкость, байты; 0 - неизвестна */
+    dlin        lin;
+    drnd        acc, seek;
+} devdata;
+
+#define DD_N 16                  /* потолок дисков (равен SM_MAX smartcore) */
+
+/* смарт-опросник - список дисков (определение - в блоке SMART ниже) */
+static sm_disk g_sm_ui[DD_N];           /* UI-поток */
+static int     g_sm_ui_n = 0;
+static int     g_sm_ui_gen = 0;         /* номер поколения в UI */
+
+static devdata g_dd[DD_N];              /* память по дискам             */
+static devdata *g_cur = NULL;           /* UI-поток: выбранный диск     */
+static char     g_dd_sel[16] = "disk0"; /* имя выбранного диска         */
+
+static int    g_duty = 5;               /* duty Sequential read, %      */
+
+/* найти или завести запись по имени ("disk0"). Только UI-поток:
+ * записи заводятся в тике по поколению смарт-опросника и dev-хуком,
+ * рабочие потоки пишут только в уже выбранную g_cur. */
+static devdata *dd_of(const char *name)
+{
+    int i;
+
+    for (i = 0; i < DD_N; i++)
+        if (g_dd[i].used && strcmp(g_dd[i].name, name) == 0)
+            return &g_dd[i];
+    for (i = 0; i < DD_N; i++) {
+        if (!g_dd[i].used) {
+            memset(&g_dd[i], 0, sizeof g_dd[i]);
+            g_dd[i].used = 1;
+            snprintf(g_dd[i].name, sizeof g_dd[i].name, "%s", name);
+            return &g_dd[i];
+        }
+    }
+    return NULL;
+}
 
 /* ---- Access map / Seek profile: одна структура на вкладку ---- */
 typedef struct {
@@ -118,27 +172,12 @@ typedef struct {
     int          run_id;        /* RUN_ACC / RUN_SEEK                 */
     const char  *name;          /* "Access map"                       */
 
-    /* под g_lock */
-    dbuf         pts;
-    dbuf         errs;          /* EIO: x = позиция (access)          */
-    volatile int cancel;
-    int          done, failed, oserr, elapsed;
-    char         err[256];
-    dgrndresult  res;
-    double       datacap;
+    devdata     *dd;            /* данные выбранного диска            */
 
     /* UI-поток */
-    char         sel[64];
-    double       selcap;
-    char         path[64];      /* снимок на Старт                    */
+    char         path[64];      /* снимок ноды на Старт               */
     int          secs, secs_run;
-    int          stat_n;        /* по скольким точкам посчитано       */
-    double       med, p99;
-    double       short_med, long_med;   /* seek: <1 MB и > 1/2 диска */
-    int          bn[NBIN];
-    double       bmed[NBIN], blo[NBIN];
 
-    NSPopUpButton *dev;
     NSSlider      *slider;
     NSTextField   *val;
     NSTextField   *status;
@@ -148,6 +187,12 @@ typedef struct {
 
 static rndtab g_acc;
 static rndtab g_seek;
+
+/* данные вкладки в devdata текущего диска */
+static drnd *drnd_of(rndtab *t)
+{
+    return (t->mode == DGRND_SEEK) ? &t->dd->seek : &t->dd->acc;
+}
 
 /* 1 - процесс с правами root (иначе чтение rdisk упрётся в EACCES) */
 static int g_is_root = 0;
@@ -159,8 +204,10 @@ static NSButton      *g_lin_start = NULL;
 static NSButton      *g_lin_stop  = NULL;
 static NSSlider      *g_lin_slider = NULL;
 static NSView        *g_lin_view = NULL;
-static NSPopUpButton *g_lin_dev = NULL;
 static NSTabView     *g_tabs = NULL;
+
+/* шапка: глобальный выбор диска над всеми вкладками */
+static NSPopUpButton *g_dd_dev = NULL;
 
 /* dev-хук -cycle */
 static int g_cycle = 0;
@@ -176,6 +223,10 @@ static int g_again = 0;
 static time_t    g_close_at = 0;
 static NSWindow *g_win = NULL;
 
+/* dev-хук -snap N: через N секунд сохранить PDF всего окна
+ * (/tmp/diskgraph-snap.pdf) - визуальная проверка UI без глаз рядом */
+static time_t g_snap_at = 0;
+
 static void rndtab_init(rndtab *t, int mode, int run_id, const char *name,
                         int secs)
 {
@@ -184,8 +235,7 @@ static void rndtab_init(rndtab *t, int mode, int run_id, const char *name,
     t->run_id = run_id;
     t->name   = name;
     t->secs   = secs;
-    t->stat_n = -1;
-    strcpy(t->sel, "/dev/rdisk0");
+    t->dd     = dd_of(g_dd_sel);
 }
 
 static rndtab *rndtab_of_run(int run)
@@ -264,13 +314,8 @@ static int bin_of(int xlog, double x, double cap)
     return (b >= NBIN) ? NBIN - 1 : b;
 }
 
-static double rnd_cap(const rndtab *t, int npts)
-{
-    /* ось по прочитанному диску, если данные есть или идёт прогон */
-    if ((npts > 0 || g_run == t->run_id) && t->datacap > 0.0)
-        return t->datacap;
-    return t->selcap;
-}
+/* ось X обоих замеров - ёмкость диска, на котором данные (dd->cap
+ * ставится и опросником (IOMedia), и begin()-калбеком ядра) */
 
 /* ------------------------------------------------------- статистика */
 
@@ -302,17 +347,22 @@ static void rnd_stats_update(rndtab *t)
     static double *v = NULL, *sv = NULL, *lv = NULL;
     static binval *bv = NULL;
     static int     valloc = 0;
+    drnd          *r;
     int            n, i, ns = 0, nl = 0, xlog = (t->mode == DGRND_SEEK);
     double         cap;
 
+    if (t->dd == NULL)
+        return;
+    r = drnd_of(t);
+
     pthread_mutex_lock(&g_lock);
-    n = t->pts.n;
-    if (n == t->stat_n) {
+    n = r->pts.n;
+    if (n == r->stat_n) {
         pthread_mutex_unlock(&g_lock);
         return;
     }
     if (n > valloc) {
-        int a = t->pts.alloc;
+        int    a = r->pts.alloc;
         double *p1 = (double *)realloc(v,  (size_t)a * sizeof(double));
         double *p2 = (double *)realloc(sv, (size_t)a * sizeof(double));
         double *p3 = (double *)realloc(lv, (size_t)a * sizeof(double));
@@ -327,9 +377,9 @@ static void rnd_stats_update(rndtab *t)
         }
         valloc = a;
     }
-    cap = rnd_cap(t, n);
+    cap = t->dd->cap;
     for (i = 0; i < n; i++) {
-        const dpt *p = &t->pts.a[i];
+        const dpt *p = &r->pts.a[i];
         v[i] = p->val;
         bv[i].b = bin_of(xlog, p->x, cap);
         bv[i].v = p->val;
@@ -341,150 +391,114 @@ static void rnd_stats_update(rndtab *t)
     pthread_mutex_unlock(&g_lock);
 
     qsort(v, (size_t)n, sizeof(double), dg_dcmp);
-    t->med = dg_pct(v, (size_t)n, 0.50);
-    t->p99 = dg_pct(v, (size_t)n, 0.99);
+    r->med = dg_pct(v, (size_t)n, 0.50);
+    r->p99 = dg_pct(v, (size_t)n, 0.99);
 
     qsort(sv, (size_t)ns, sizeof(double), dg_dcmp);
     qsort(lv, (size_t)nl, sizeof(double), dg_dcmp);
-    t->short_med = median_sorted(sv, ns);
-    t->long_med  = median_sorted(lv, nl);
+    r->short_med = median_sorted(sv, ns);
+    r->long_med  = median_sorted(lv, nl);
 
     qsort(bv, (size_t)n, sizeof(binval), bv_cmp);
     for (i = 0; i < NBIN; i++)
-        t->bn[i] = 0;
+        r->bn[i] = 0;
     for (i = 0; i < n; ) {
         int b = bv[i].b, j = i, k;
         while (j < n && bv[j].b == b)
             j++;
         k = j - i;
-        t->bn[b]   = k;
-        t->bmed[b] = bv[i + (int)(0.50 * (double)(k - 1) + 0.5)].v;
-        t->blo[b]  = bv[i + (int)(0.10 * (double)(k - 1) + 0.5)].v;
+        r->bn[b]   = k;
+        r->bmed[b] = bv[i + (int)(0.50 * (double)(k - 1) + 0.5)].v;
+        r->blo[b]  = bv[i + (int)(0.10 * (double)(k - 1) + 0.5)].v;
         i = j;
     }
-    t->stat_n = n;
+    r->stat_n = n;
 }
 
 /* ------------------------------------------------ список устройств */
 
-static int intcmp(const void *a, const void *b)
+/*
+ * Единый энумератор дисков - фоновый смарт-опросник (смартcore
+ * sm_scan/sm_probe): он перечисляет ВСЕ целые /dev/diskN независимо от
+ * шины (внутренний ATA, USB, FireWire), достаёт из реестра IOMedia
+ * ёмкость (без открытия ноды - спящий диск не будит), модель и шину
+ * там, где мост их выдаёт, SMART - где он есть. Порядковый номер diskN
+ * един для всех шин, rdiskN - та же нода в raw-проекции.
+ *
+ * UI-поток: записи по дискам (devdata) заводятся/обогащаются здесь,
+ * по завершённому поколению опроса (см. sm_poll -> dd_repopulate).
+ */
+
+static const sm_disk *sm_find(const char *name);
+static NSString *sm_title(const sm_disk *d);
+static NSString *u8(const char *s);
+
+/* "disk0 - ST360021A, 55.9 GB" -> "disk0" */
+static void title_to_disk(const char *u, char *out, size_t outsz)
 {
-    return *(const int *)a - *(const int *)b;
-}
-
-/* /dev/rdiskN (raw) и /dev/diskN (buffered) - только целые диски;
- * разбиения (sN) не нужны, пары идут рядом для сравнения */
-static NSArray *scan_disks(void)
-{
-    NSMutableArray *a = [NSMutableArray array];
-    DIR            *d = opendir("/dev");
-    struct dirent  *e;
-    int             nums[64];
-    int             n = 0, i, j, dup;
-
-    if (d != NULL) {
-        while ((e = readdir(d)) != NULL) {
-            const char *nm = e->d_name;
-            const char *p;
-            int         val = 0, ok = 1;
-
-            if (strncmp(nm, "rdisk", 5) == 0) {
-                p = nm + 5;
-            } else if (strncmp(nm, "disk", 4) == 0) {
-                p = nm + 4;
-            } else {
-                continue;
-            }
-            if (*p == 0)
-                continue;
-            while (*p) {
-                if (*p < '0' || *p > '9') { ok = 0; break; }
-                val = val * 10 + (*p - '0');
-                p++;
-            }
-            if (!ok)
-                continue;
-
-            dup = 0;
-            for (j = 0; j < n; j++)
-                if (nums[j] == val)
-                    dup = 1;
-            if (dup)
-                continue;
-            if (n < 64)
-                nums[n++] = val;
-        }
-        closedir(d);
-    }
-
-    qsort(nums, (size_t)n, sizeof(int), intcmp);
-
-    for (i = 0; i < n; i++) {
-        char pa[64], pb[64];
-
-        snprintf(pa, sizeof pa, "/dev/rdisk%d", nums[i]);
-        snprintf(pb, sizeof pb, "/dev/disk%d",  nums[i]);
-        if (access(pa, F_OK) == 0)
-            [a addObject:[NSString stringWithUTF8String:pa]];
-        if (access(pb, F_OK) == 0)
-            [a addObject:[NSString stringWithUTF8String:pb]];
-    }
-    return a;
-}
-
-/* /dev/diskN идёт через кеш блоков ядра порциями по 4K (F_NOCACHE на
- * него не действует) - в меню помечен, чтобы не путать с замером */
-static NSString *dev_title(NSString *path)
-{
-    if (strncmp([path UTF8String], "/dev/disk", 9) == 0)
-        return [path stringByAppendingString:@" (buffered)"];
-    return path;
-}
-
-/* путь из заголовка пункта: до первого пробела */
-static void title_to_path(NSString *t, char *out, size_t outsz)
-{
-    const char *u = [t UTF8String];
-    size_t      i;
+    size_t i;
 
     for (i = 0; u != NULL && u[i] != 0 && u[i] != ' ' && i + 1 < outsz; i++)
         out[i] = u[i];
     out[i] = 0;
 }
 
-/* заполнить popup и выставить в нём sel; если sel пропал - первый диск
- * (sel перезаписывается). Возврат 1 - выбор изменился. */
-static int fill_dev_popup(NSPopUpButton *pop, char *sel, size_t selsz)
+/* пункт шапки по диску; у диска без паспорта (USB-мост) - как у опроса
+ * SMART: только имя и ёмкость от IOMedia */
+static NSString *dd_title(const devdata *dd)
 {
-    NSArray *disks;
-    int      i, idx = -1;
+    const sm_disk *d = sm_find(dd->name);
 
-    if (pop == NULL)
-        return 0;
+    if (d == NULL)
+        return u8(dd->name);
+    return sm_title(d);
+}
 
-    disks = scan_disks();
-    [pop removeAllItems];
+/* UI-поток: осмотреть поколение опросника - завести недостающие записи,
+ * дописать ёмкость (модель беру оттуда же; файловая система не нужна) */
+static void dd_sync_ui(void)
+{
+    int i;
 
-    for (i = 0; i < (int)[disks count]; i++) {
-        NSString *t = [disks objectAtIndex:i];
-        [pop addItemWithTitle:dev_title(t)];
-        if (strcmp([t UTF8String], sel) == 0)
-            idx = i;
+    for (i = 0; i < g_sm_ui_n; i++) {
+        devdata *dd = dd_of(g_sm_ui[i].name);
+        if (dd != NULL && dd->cap == 0.0 && g_sm_ui[i].bytes > 0)
+            dd->cap = (double)g_sm_ui[i].bytes;
     }
+}
 
-    if ([disks count] == 0) {
-        [pop addItemWithTitle:[NSString stringWithUTF8String:"(нет дисков)"]];
-        [pop selectItemAtIndex:0];
-        return 0;
+/* UI-поток: перезаполнить шапку списком дисков поколения. Выбор
+ * сохраняется; если выбранного нет в списке (диск исчез) - первый.
+ * Записи со смарт-данными пусты до первого поколения - пункт-заглушка. */
+static void dd_repopulate(void)
+{
+    int i, n = 0, sel = -1;
+
+    if (g_dd_dev == NULL)
+        return;
+    [g_dd_dev removeAllItems];
+    for (i = 0; i < g_sm_ui_n; i++) {
+        devdata *dd = dd_of(g_sm_ui[i].name);
+
+        if (dd == NULL)
+            continue;               /* DD_N закончился */
+        if (dd->cap == 0.0 && g_sm_ui[i].bytes > 0)
+            dd->cap = (double)g_sm_ui[i].bytes;
+        [g_dd_dev addItemWithTitle:dd_title(dd)];
+        if (strcmp(dd->name, g_dd_sel) == 0)
+            sel = n;
+        n++;
     }
-    if (idx >= 0) {
-        [pop selectItemAtIndex:idx];
-        return 0;
+    if (n == 0) {
+        [g_dd_dev addItemWithTitle:u8("(опрос дисков...)")];
+        [g_dd_dev selectItemAtIndex:0];
+        return;
     }
-    [pop selectItemAtIndex:0];
-    strncpy(sel, [[disks objectAtIndex:0] UTF8String], selsz - 1);
-    sel[selsz - 1] = 0;
-    return 1;
+    if (sel < 0) {
+        snprintf(g_dd_sel, sizeof g_dd_sel, "%s", g_sm_ui[0].name);
+        sel = 0;
+    }
+    [g_dd_dev selectItemAtIndex:sel];
 }
 
 /* ------------------------------------------------------- шрифты/текст */
@@ -892,6 +906,8 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
 {
     static dbuf snap = { NULL, 0, 0 };
     static dbuf esnap = { NULL, 0, 0 };
+    devdata *dd = g_cur;
+    dlin    *r  = (dd != NULL) ? &dd->lin : NULL;
     plotgeo g;
     double  raw = 0.0;
     int     i, running = (g_run == RUN_LIN);
@@ -899,16 +915,18 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
 
     (void)dirty;
 
-    pthread_mutex_lock(&g_lock);
-    pts_copy(&g_lin, &snap);
-    pts_copy(&g_lin_errs, &esnap);
-    g.cap  = (snap.n > 0 || running) ? g_lin_datacap : 0.0;
-    bytes  = g_lin_bytes;
-    us     = g_lin_time_us;
-    pthread_mutex_unlock(&g_lock);
+    if (dd == NULL) {
+        draw_hint(plot_rect([self bounds]), idle_hint());
+        return;
+    }
 
-    if (g.cap <= 0.0)
-        g.cap = g_lin_selcap;
+    pthread_mutex_lock(&g_lock);
+    pts_copy(&r->pts, &snap);
+    pts_copy(&r->errs, &esnap);
+    g.cap  = dd->cap;
+    bytes  = r->bytes;
+    us     = r->time_us;
+    pthread_mutex_unlock(&g_lock);
     g.xlog = 0;
 
     for (i = 0; i < snap.n; i++)
@@ -1006,16 +1024,19 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
     int     i, over = 0, seek, running;
 
     (void)dirty;
-    if (t == NULL)
+    if (t == NULL || t->dd == NULL)
         return;
     seek    = (t->mode == DGRND_SEEK);
     running = (g_run == t->run_id);
 
-    pthread_mutex_lock(&g_lock);
-    pts_copy(&t->pts, &snap);
-    pts_copy(&t->errs, &esnap);
-    g.cap = rnd_cap(t, snap.n);
-    pthread_mutex_unlock(&g_lock);
+    {
+        drnd *r = drnd_of(t);
+        pthread_mutex_lock(&g_lock);
+        pts_copy(&r->pts, &snap);
+        pts_copy(&r->errs, &esnap);
+        g.cap = t->dd->cap;
+        pthread_mutex_unlock(&g_lock);
+    }
     g.xlog = seek;
 
     for (i = 0; i < snap.n; i++)
@@ -1024,11 +1045,14 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
 
     /* единичный выброс (рекалибровка, спин-ап) не сплющивает облако:
      * шкала по 2*p99, всё выше - красной меткой у верхнего края */
-    if (snap.n >= 100 && t->p99 > 0.0) {
-        if (!seek)
-            thr = t->p99;
-        if (raw > 3.0 * t->p99)
-            raw = 2.0 * t->p99;
+    if (snap.n >= 100) {
+        drnd *r = drnd_of(t);
+        if (r->stat_n > 0 && r->p99 > 0.0) {
+            if (!seek)
+                thr = r->p99;
+            if (raw > 3.0 * r->p99)
+                raw = 2.0 * r->p99;
+        }
     }
 
     g.pv   = plot_rect([self bounds]);
@@ -1077,7 +1101,7 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
     }
 
     /* кривые по корзинам дистанции: медиана и p10 (≈ чистый seek) */
-    if (t->stat_n >= 50) {
+    if (drnd_of(t)->stat_n >= 50) {
         NSBezierPath *med = [NSBezierPath bezierPath];
         NSBezierPath *lo  = [NSBezierPath bezierPath];
         float  dash[2] = {4.0f, 2.0f};
@@ -1088,12 +1112,12 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
             float  x;
             NSPoint pm, pl;
 
-            if (t->bn[i] < 5)
+            if (drnd_of(t)->bn[i] < 5)
                 continue;
             fx = ((double)i + 0.5) / (double)NBIN;
             x  = NSMinX(g.pv) + (float)fx * g.pv.size.width;
-            pm = geo_pt(&g, 0.0, t->bmed[i]);
-            pl = geo_pt(&g, 0.0, t->blo[i]);
+            pm = geo_pt(&g, 0.0, drnd_of(t)->bmed[i]);
+            pl = geo_pt(&g, 0.0, drnd_of(t)->blo[i]);
             pm.x = pl.x = x;
             if (!started) {
                 [med moveToPoint:pm];
@@ -1117,8 +1141,8 @@ static int draw_eio(const plotgeo *g, const dbuf *errs)
 
     if (!seek && snap.n >= 20) {
         char lbl[48];
-        snprintf(lbl, sizeof lbl, "p99 %.1f ms", t->p99 / 1000.0);
-        draw_hmark(&g, t->p99, col_spike(), lbl);
+        snprintf(lbl, sizeof lbl, "p99 %.1f ms", drnd_of(t)->p99 / 1000.0);
+        draw_hmark(&g, drnd_of(t)->p99, col_spike(), lbl);
     }
 
     {
@@ -1190,12 +1214,9 @@ static int     g_sm_res_n = 0;
 static int     g_sm_gen = 0;            /* +1 на каждый завершённый опрос */
 static int     g_sm_busy = 0;           /* UI-поток: опрос идёт */
 
-static sm_disk g_sm_ui[SM_MAX];         /* UI-поток */
-static int     g_sm_ui_n = 0;
-static int     g_sm_ui_gen = 0;
-static char    g_sm_sel[16] = "disk0";
+/* g_sm_ui (UI-поток, копия поколения) объявлен выше - около devdata,
+ * т.к. список дисков (шапка и devdata) собирается из него */
 
-static NSPopUpButton *g_sm_dev = NULL;
 static NSButton      *g_sm_refresh = NULL;
 static NSTextField   *g_sm_verdict = NULL;
 static NSTextField   *g_sm_note = NULL;
@@ -1223,40 +1244,31 @@ static void dev_to_disk(const char *path, char *out, size_t outsz)
     snprintf(out, outsz, "%s", p);
 }
 
-/* хвост статуса замера: "   ·   SMART: WARN (...)" для плохого диска */
-static void sm_tail(const char *path, char *out, size_t outsz)
-{
-    char           nm[16];
-    const sm_disk *d;
-
-    out[0] = 0;
-    dev_to_disk(path, nm, sizeof nm);
-    d = sm_find(nm);
-    if (d != NULL && (d->vd == VD_WARN || d->vd == VD_FAIL))
-        snprintf(out, outsz, "   ·   SMART: %s (%s)",
-                 sm_verdict_str(d->vd), d->note);
-}
-
 static void status_lin(void)
 {
+    devdata *dd = g_cur;
+    dlin    *r;
     char s[320];
     int  n, idx, failed, canc, oserr, elapsed;
     uint64_t total, bytes, us;
     dglinresult res;
     char err[256];
 
+    if (dd == NULL)
+        return;
+    r = &dd->lin;
     pthread_mutex_lock(&g_lock);
-    n      = g_lin.n;
-    idx    = g_lin_idx_done;
-    total  = g_lin_total;
-    bytes  = g_lin_bytes;
-    us     = g_lin_time_us;
-    failed = g_lin_failed;
-    oserr  = g_lin_oserr;
-    canc   = g_lin_cancel;
-    res    = g_lin_res;
-    elapsed = g_lin_elapsed;
-    strncpy(err, g_lin_err, sizeof err);
+    n      = r->pts.n;
+    idx    = r->idx_done;
+    total  = r->total;
+    bytes  = r->bytes;
+    us     = r->time_us;
+    failed = r->failed;
+    oserr  = r->oserr;
+    canc   = r->cancel;
+    res    = r->res;
+    elapsed = r->elapsed;
+    strncpy(err, r->err, sizeof err);
     err[sizeof err - 1] = 0;
     pthread_mutex_unlock(&g_lock);
 
@@ -1269,9 +1281,9 @@ static void status_lin(void)
                      "Сегмент %d / %llu   ·   %.1f MB/s   ·   "
                      "duty %d%%   ·   %d:%02d",
                      idx, (unsigned long long)total, mbs_of(bytes, us),
-                     g_lin_duty, t / 60, t % 60);
+                     r->duty, t / 60, t % 60);
         else
-            snprintf(s, sizeof s, "Открываю %s ...", g_lin_path);
+            snprintf(s, sizeof s, "Открываю %s ...", r->path);
         set_status(g_lin_status, s, ST_NORMAL);
     } else if (failed) {
         err_text(s, sizeof s, oserr, err);
@@ -1289,29 +1301,24 @@ static void status_lin(void)
     } else if (!g_is_root) {
         set_status(g_lin_status, k_noroot, ST_ERROR);
     } else {
-        if (g_lin_selcap > 0.0)
+        if (dd->cap > 0.0)
             snprintf(s, sizeof s,
                      "Будет прочитано ≈ %.1f GB из %.1f GB "
                      "(%d%% поверхности, сегменты по 32 MB)",
-                     g_lin_selcap / GIB * (double)g_duty / 100.0,
-                     g_lin_selcap / GIB, g_duty);
+                     dd->cap / GIB * (double)g_duty / 100.0,
+                     dd->cap / GIB, g_duty);
         else
             snprintf(s, sizeof s, "Выберите диск и нажмите Старт");
-        {
-            char tail[160];
-            sm_tail(g_lin_sel, tail, sizeof tail);
-            strncat(s, tail, sizeof s - strlen(s) - 1);
-        }
         set_status(g_lin_status, s, ST_NORMAL);
     }
 }
 
 /* seek: "короткие ... · длинные ..." для статуса */
-static void seek_summary(const rndtab *t, char *out, size_t outsz)
+static void seek_summary(const drnd *r, char *out, size_t outsz)
 {
     snprintf(out, outsz,
              "хопы < 1 MB: med %.1f ms   ·   > ½ диска: med %.1f ms",
-             t->short_med / 1000.0, t->long_med / 1000.0);
+             r->short_med / 1000.0, r->long_med / 1000.0);
 }
 
 static void status_rnd(rndtab *t)
@@ -1321,21 +1328,28 @@ static void status_rnd(rndtab *t)
     dgrndresult res;
     char err[256];
     int  seek = (t->mode == DGRND_SEEK);
+    drnd *r = drnd_of(t);
 
+    if (r != NULL) {
     pthread_mutex_lock(&g_lock);
-    n       = t->pts.n;
-    failed  = t->failed;
-    oserr   = t->oserr;
-    canc    = t->cancel;
-    res     = t->res;
-    elapsed = t->elapsed;
-    strncpy(err, t->err, sizeof err);
+    n       = r->pts.n;
+    failed  = r->failed;
+    oserr   = r->oserr;
+    canc    = r->cancel;
+    res     = r->res;
+    elapsed = r->elapsed;
+    strncpy(err, r->err, sizeof err);
     err[sizeof err - 1] = 0;
     pthread_mutex_unlock(&g_lock);
+    } else {
+        n = failed = oserr = canc = elapsed = 0;
+        memset(&res, 0, sizeof res);
+        err[0] = 0;
+    }
 
     extra[0] = 0;
-    if (seek && t->stat_n > 0)
-        seek_summary(t, extra, sizeof extra);
+    if (seek && r->stat_n > 0)
+        seek_summary(r, extra, sizeof extra);
 
     if (g_run == t->run_id) {
         int tt = (int)(time(NULL) - g_run_t0);
@@ -1350,7 +1364,7 @@ static void status_rnd(rndtab *t)
             snprintf(s, sizeof s,
                      "ops %d   ·   %d / %d с   ·   med %.1f ms   ·   "
                      "p99 %.1f ms",
-                     n, tt, t->secs_run, t->med / 1000.0, t->p99 / 1000.0);
+                     n, tt, t->secs_run, r->med / 1000.0, r->p99 / 1000.0);
         set_status(t->status, s, ST_NORMAL);
     } else if (failed) {
         err_text(s, sizeof s, oserr, err);
@@ -1385,11 +1399,6 @@ static void status_rnd(rndtab *t)
             snprintf(s, sizeof s,
                      "%d с чтений по 4 KB в случайные точки - карта времени "
                      "доступа по поверхности", t->secs);
-        {
-            char tail[160];
-            sm_tail(t->sel, tail, sizeof tail);
-            strncat(s, tail, sizeof s - strlen(s) - 1);
-        }
         set_status(t->status, s, ST_NORMAL);
     }
 }
@@ -1405,61 +1414,64 @@ static void status_all(void)
 
 static void lin_begin(void *ctx, const dglininfo *info)
 {
-    (void)ctx;
+    devdata *dd = (devdata *)ctx;
+
     pthread_mutex_lock(&g_lock);
-    g_lin_total = info->chunks;
-    g_lin_datacap = (double)info->capacity;
+    dd->lin.total = info->chunks;
+    dd->cap = (double)info->capacity;
     pthread_mutex_unlock(&g_lock);
 }
 
 static void lin_err(void *ctx, const dglinerr *e)
 {
-    (void)ctx;
+    devdata *dd = (devdata *)ctx;
+
     pthread_mutex_lock(&g_lock);
-    pts_add(&g_lin_errs, (double)e->off, 0.0, 0);
+    pts_add(&dd->lin.errs, (double)e->off, 0.0, 0);
     pthread_mutex_unlock(&g_lock);
 }
 
 static void lin_seg(void *ctx, const dglinseg *seg)
 {
-    (void)ctx;
+    devdata *dd = (devdata *)ctx;
+
     pthread_mutex_lock(&g_lock);
     /* точка - в середине сегмента: кривая от начала до конца диска */
-    pts_add(&g_lin, (double)seg->off + (double)seg->len * 0.5,
+    pts_add(&dd->lin.pts, (double)seg->off + (double)seg->len * 0.5,
             mbs_of(seg->bytes, seg->time_us), 0);
-    g_lin_bytes   += seg->bytes;
-    g_lin_time_us += seg->time_us;
-    g_lin_idx_done = (int)(seg->index + 1);
+    dd->lin.bytes    += seg->bytes;
+    dd->lin.time_us  += seg->time_us;
+    dd->lin.idx_done = (int)(seg->index + 1);
     pthread_mutex_unlock(&g_lock);
 }
 
 static void *lin_thread(void *arg)
 {
+    devdata    *dd = (devdata *)arg;
     dglincfg    cfg;
     dglinresult res;
     char        err[256];
     int         rc;
     time_t      t0 = time(NULL);
 
-    (void)arg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.dev    = g_lin_path;
+    cfg.dev    = dd->lin.path;
     cfg.seg    = LIN_SEG;
     cfg.blk    = LIN_BLK;
-    cfg.duty   = g_lin_duty;
+    cfg.duty   = dd->lin.duty;
     cfg.extent = 0;
 
-    rc = dglincore(&cfg, lin_begin, lin_seg, lin_err, NULL,
-                   &g_lin_cancel, &res, err, sizeof err);
+    rc = dglincore(&cfg, lin_begin, lin_seg, lin_err, dd,
+                   &dd->lin.cancel, &res, err, sizeof err);
 
     pthread_mutex_lock(&g_lock);
-    g_lin_failed = (rc != 0);
-    g_lin_oserr  = res.oserr;
+    dd->lin.failed = (rc != 0);
+    dd->lin.oserr  = res.oserr;
     if (rc != 0)
-        snprintf(g_lin_err, sizeof g_lin_err, "%s", err);
-    g_lin_res = res;
-    g_lin_elapsed = (int)(time(NULL) - t0);
-    g_lin_done = 1;
+        snprintf(dd->lin.err, sizeof dd->lin.err, "%s", err);
+    dd->lin.res = res;
+    dd->lin.elapsed = (int)(time(NULL) - t0);
+    dd->lin.done = 1;
     pthread_mutex_unlock(&g_lock);
     return NULL;
 }
@@ -1468,7 +1480,7 @@ static void rnd_begin(void *ctx, const dgrndinfo *info)
 {
     rndtab *t = (rndtab *)ctx;
     pthread_mutex_lock(&g_lock);
-    t->datacap = (double)info->capacity;
+    t->dd->cap = (double)info->capacity;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1476,24 +1488,28 @@ static void rnd_begin(void *ctx, const dgrndinfo *info)
 static void rnd_op(void *ctx, const dgrndop *op)
 {
     rndtab *t = (rndtab *)ctx;
+    drnd   *r = drnd_of(t);
     double  x = (t->mode == DGRND_SEEK) ? (double)op->dist : (double)op->off;
 
     pthread_mutex_lock(&g_lock);
-    pts_add(&t->pts, x, (double)op->us, op->dir);
+    pts_add(&r->pts, x, (double)op->us, op->dir);
     pthread_mutex_unlock(&g_lock);
 }
 
 static void rnd_err(void *ctx, const dgrnderr *e)
 {
     rndtab *t = (rndtab *)ctx;
+    drnd   *r = drnd_of(t);
+
     pthread_mutex_lock(&g_lock);
-    pts_add(&t->errs, (double)e->off, (double)e->us, 0);
+    pts_add(&r->errs, (double)e->off, (double)e->us, 0);
     pthread_mutex_unlock(&g_lock);
 }
 
 static void *rnd_thread(void *arg)
 {
     rndtab     *t = (rndtab *)arg;
+    drnd       *r = drnd_of(t);
     dgrndcfg    cfg;
     dgrndresult res;
     char        err[256];
@@ -1509,16 +1525,16 @@ static void *rnd_thread(void *arg)
     cfg.mode   = t->mode;
 
     rc = dgrndcore(&cfg, rnd_begin, rnd_op, rnd_err, t,
-                   &t->cancel, &res, err, sizeof err);
+                   &r->cancel, &res, err, sizeof err);
 
     pthread_mutex_lock(&g_lock);
-    t->failed = (rc != 0);
-    t->oserr  = res.oserr;
+    r->failed = (rc != 0);
+    r->oserr  = res.oserr;
     if (rc != 0)
-        snprintf(t->err, sizeof t->err, "%s", err);
-    t->res = res;
-    t->elapsed = (int)(time(NULL) - t0);
-    t->done = 1;
+        snprintf(r->err, sizeof r->err, "%s", err);
+    r->res = res;
+    r->elapsed = (int)(time(NULL) - t0);
+    r->done = 1;
     pthread_mutex_unlock(&g_lock);
     return NULL;
 }
@@ -1526,12 +1542,14 @@ static void *rnd_thread(void *arg)
 /* UI-поток: доступность контролов по состоянию прогона */
 static void update_rnd_controls(rndtab *t)
 {
-    int idle = (g_run == RUN_IDLE);
+    drnd *r = drnd_of(t);
+    int  idle = (g_run == RUN_IDLE);
 
+    if (r == NULL)
+        return;
     [t->start setEnabled:idle];
-    [t->stop setEnabled:(g_run == t->run_id && !t->cancel)];
+    [t->stop setEnabled:(g_run == t->run_id && !r->cancel)];
     [t->slider setEnabled:idle];
-    [t->dev setEnabled:idle];
 }
 
 static void update_controls(void)
@@ -1539,9 +1557,10 @@ static void update_controls(void)
     int idle = (g_run == RUN_IDLE);
 
     [g_lin_start setEnabled:idle];
-    [g_lin_stop setEnabled:(g_run == RUN_LIN && !g_lin_cancel)];
+    [g_lin_stop setEnabled:(g_run == RUN_LIN && g_cur != NULL &&
+                            !g_cur->lin.cancel)];
     [g_lin_slider setEnabled:idle];
-    [g_lin_dev setEnabled:idle];
+    [g_dd_dev setEnabled:idle];
     update_rnd_controls(&g_acc);
     update_rnd_controls(&g_seek);
 }
@@ -1558,37 +1577,40 @@ static int start_thread(void *(*fn)(void *), void *arg)
 
 static void lin_start(void)
 {
+    devdata *dd;
+
     if (g_run != RUN_IDLE)
+        return;
+    dd = g_cur;
+    if (dd == NULL)
         return;
 
     pthread_mutex_lock(&g_lock);
-    g_lin.n = 0;
-    g_lin_errs.n = 0;
-    g_lin_total = 0;
-    g_lin_bytes = 0;
-    g_lin_time_us = 0;
-    g_lin_idx_done = 0;
-    g_lin_failed = 0;
-    g_lin_oserr = 0;
-    g_lin_err[0] = 0;
-    g_lin_done = 0;
-    g_lin_datacap = g_lin_selcap;
-    memset(&g_lin_res, 0, sizeof g_lin_res);
+    dd->lin.pts.n = 0;
+    dd->lin.errs.n = 0;
+    dd->lin.total = 0;
+    dd->lin.bytes = 0;
+    dd->lin.time_us = 0;
+    dd->lin.idx_done = 0;
+    dd->lin.failed = 0;
+    dd->lin.oserr = 0;
+    dd->lin.err[0] = 0;
+    dd->lin.done = 0;
+    memset(&dd->lin.res, 0, sizeof dd->lin.res);
     pthread_mutex_unlock(&g_lock);
 
-    g_lin_cancel = 0;
+    dd->lin.cancel = 0;
     g_run = RUN_LIN;
     g_run_t0 = time(NULL);
 
-    strncpy(g_lin_path, g_lin_sel, sizeof g_lin_path - 1);
-    g_lin_path[sizeof g_lin_path - 1] = 0;
-    g_lin_duty = g_duty;
+    snprintf(dd->lin.path, sizeof dd->lin.path, "/dev/r%s", dd->name);
+    dd->lin.duty = g_duty;
 
-    if (!start_thread(lin_thread, NULL)) {
+    if (!start_thread(lin_thread, dd)) {
         pthread_mutex_lock(&g_lock);
-        snprintf(g_lin_err, sizeof g_lin_err, "не удалось создать поток");
-        g_lin_failed = 1;
-        g_lin_done = 1;
+        snprintf(dd->lin.err, sizeof dd->lin.err, "не удалось создать поток");
+        dd->lin.failed = 1;
+        dd->lin.done = 1;
         pthread_mutex_unlock(&g_lock);
     }
     update_controls();
@@ -1597,78 +1619,75 @@ static void lin_start(void)
 
 static void rnd_start(rndtab *t)
 {
+    devdata *dd = t->dd;
+    drnd    *r;
+
     if (g_run != RUN_IDLE)
         return;
+    if (dd == NULL)
+        return;
+    r = drnd_of(t);
 
     pthread_mutex_lock(&g_lock);
-    t->pts.n = 0;
-    t->errs.n = 0;
-    t->failed = 0;
-    t->oserr = 0;
-    t->err[0] = 0;
-    t->done = 0;
-    t->datacap = t->selcap;
-    memset(&t->res, 0, sizeof t->res);
+    r->pts.n = 0;
+    r->errs.n = 0;
+    r->failed = 0;
+    r->oserr = 0;
+    r->err[0] = 0;
+    r->done = 0;
+    memset(&r->res, 0, sizeof r->res);
     pthread_mutex_unlock(&g_lock);
 
-    t->med = t->p99 = t->short_med = t->long_med = 0.0;
-    t->stat_n = -1;
-    memset(t->bn, 0, sizeof t->bn);
-    t->cancel = 0;
+    r->med = r->p99 = r->short_med = r->long_med = 0.0;
+    r->stat_n = -1;
+    memset(r->bn, 0, sizeof r->bn);
+    r->cancel = 0;
     g_run = t->run_id;
     g_run_t0 = time(NULL);
 
-    strncpy(t->path, t->sel, sizeof t->path - 1);
-    t->path[sizeof t->path - 1] = 0;
+    snprintf(t->path, sizeof t->path, "/dev/r%s", dd->name);
     t->secs_run = t->secs;
 
     if (!start_thread(rnd_thread, t)) {
         pthread_mutex_lock(&g_lock);
-        snprintf(t->err, sizeof t->err, "не удалось создать поток");
-        t->failed = 1;
-        t->done = 1;
+        snprintf(r->err, sizeof r->err, "не удалось создать поток");
+        r->failed = 1;
+        r->done = 1;
         pthread_mutex_unlock(&g_lock);
     }
     update_controls();
     status_rnd(t);
 }
 
-/* UI-поток: выбор в popup поменялся - ёмкость для оси и подсказки */
-static void lin_sel_changed(void)
+static void sm_show(void);              /* ниже, в блоке SMART */
+static void sm_tab_light(void);         /* там же */
+
+/* UI-поток: выбрать диск (после devChanged / тихого переезда выбора)
+ * - вкладки и статусы переключаются на его devdata; у диска с
+ * результатами графики показываются как были, у нового - пустые */
+static void dd_select(void)
 {
-    g_lin_selcap = dg_probe_capacity(g_lin_sel);
-    status_lin();
+    devdata *dd = dd_of(g_dd_sel);
+
+    if (dd == NULL)
+        return;
+    g_cur = dd;
+    g_acc.dd  = dd;
+    g_seek.dd = dd;
+    status_all();
     [g_lin_view setNeedsDisplay:YES];
-}
-
-static void rnd_sel_changed(rndtab *t)
-{
-    t->selcap = dg_probe_capacity(t->sel);
-    t->stat_n = -1;                 /* корзины зависят от ёмкости */
-    status_rnd(t);
-    [t->view setNeedsDisplay:YES];
-}
-
-static void refresh_devs(void)
-{
-    if (g_run != RUN_IDLE)
-        return;                     /* popup-ы заблокированы - не трогаем */
-    if (fill_dev_popup(g_lin_dev, g_lin_sel, sizeof g_lin_sel))
-        lin_sel_changed();
-    if (fill_dev_popup(g_acc.dev, g_acc.sel, sizeof g_acc.sel))
-        rnd_sel_changed(&g_acc);
-    if (fill_dev_popup(g_seek.dev, g_seek.sel, sizeof g_seek.sel))
-        rnd_sel_changed(&g_seek);
+    [g_acc.view setNeedsDisplay:YES];
+    [g_seek.view setNeedsDisplay:YES];
+    sm_tab_light();
+    sm_show();
 }
 
 /* по контролу - его random-вкладка (NULL - Linear) */
 static rndtab *rndtab_of(id ctl)
 {
-    if (ctl == g_acc.start || ctl == g_acc.stop || ctl == g_acc.slider ||
-        ctl == g_acc.dev)
+    if (ctl == g_acc.start || ctl == g_acc.stop || ctl == g_acc.slider)
         return &g_acc;
-    if (ctl == g_seek.start || ctl == g_seek.stop || ctl == g_seek.slider ||
-        ctl == g_seek.dev)
+    if (ctl == g_seek.start || ctl == g_seek.stop || ctl == g_seek.slider)
         return &g_seek;
     return NULL;
 }
@@ -1806,10 +1825,24 @@ static NSString *sm_title(const sm_disk *d)
     return [NSString stringWithUTF8String:t];
 }
 
+/* UI-поток: ярлык SMART-вкладки: (!) только если ВЫБРАННЫЙ диск
+ * WARN/FAIL (не общий машинный флаг по всем дискам) */
+static void sm_tab_light(void)
+{
+    const sm_disk *d = sm_find(g_dd_sel);
+    int bad = (d != NULL && (d->vd == VD_WARN || d->vd == VD_FAIL));
+
+    if (g_sm_tab == NULL)
+        return;
+    [g_sm_tab setLabel:[NSString stringWithUTF8String:
+                           bad ? "SMART (!)" : "SMART"]];
+    [g_tabs setNeedsDisplay:YES];
+}
+
 /* UI-поток: показать выбранный диск (плашка, паспорт, таблица) */
 static void sm_show(void)
 {
-    const sm_disk *d = sm_find(g_sm_sel);
+    const sm_disk *d = sm_find(g_dd_sel);
     char  s[1024];
     NSColor *c;
 
@@ -1860,7 +1893,7 @@ static void sm_show(void)
 /* UI-поток: тик - забрать новое поколение опроса */
 static void sm_poll(void)
 {
-    int gen, i, bad = 0;
+    int gen;
 
     pthread_mutex_lock(&g_lock);
     gen = g_sm_gen;
@@ -1875,25 +1908,17 @@ static void sm_poll(void)
     g_sm_busy = 0;
     [g_sm_refresh setEnabled:YES];
 
-    /* popup: имена + модели; выбор сохраняется */
-    [g_sm_dev removeAllItems];
-    for (i = 0; i < g_sm_ui_n; i++) {
-        [g_sm_dev addItemWithTitle:sm_title(&g_sm_ui[i])];
-        if (strcmp(g_sm_ui[i].name, g_sm_sel) == 0)
-            [g_sm_dev selectItemAtIndex:i];
-        if (g_sm_ui[i].vd == VD_WARN || g_sm_ui[i].vd == VD_FAIL)
-            bad = 1;
-    }
-    if (g_sm_ui_n > 0 && sm_find(g_sm_sel) == NULL) {
-        snprintf(g_sm_sel, sizeof g_sm_sel, "%s", g_sm_ui[0].name);
-        [g_sm_dev selectItemAtIndex:0];
+    /* шапка: список дисков нового поколения; выбор сохраняется.
+     * Во время прогона шапка заморожена - не трогаем ни список, ни
+     * выбор (иначе dd_select мог бы перепрыгнуть на другой диск) */
+    if (g_run == RUN_IDLE) {
+        dd_sync_ui();
+        dd_repopulate();
+        dd_select();
     }
 
-    /* "лампочка" на ярлыке вкладки */
-    [g_sm_tab setLabel:[NSString stringWithUTF8String:
-                           bad ? "SMART (!)" : "SMART"]];
-    [g_tabs setNeedsDisplay:YES];
-    sm_show();
+    /* "лампочка" на ярлыке вкладки - по ВЫБРАННОМУ диску */
+    sm_tab_light();
 }
 
 /* ------------------------------------------------------------ контроллер */
@@ -1909,7 +1934,6 @@ static void sm_poll(void)
 - (void)appActive:(NSNotification *)n;
 - (void)windowDidResize:(NSNotification *)n;
 - (void)smRefresh:(id)s;
-- (void)smDevChanged:(id)s;
 - (void)tick:(NSTimer *)timer;
 - (void)quit:(id)s;
 @end
@@ -1947,8 +1971,8 @@ static void sm_poll(void)
 - (void)linStop:(id)s
 {
     (void)s;
-    if (g_run == RUN_LIN) {
-        g_lin_cancel = 1;
+    if (g_run == RUN_LIN && g_cur != NULL) {
+        g_cur->lin.cancel = 1;
         update_controls();
         status_lin();
     }
@@ -1964,12 +1988,17 @@ static void sm_poll(void)
 - (void)rndStop:(id)s
 {
     rndtab *t = rndtab_of(s);
+    drnd   *r;
+
     if (t == NULL)
         t = rndtab_of_run(g_run);   /* dev-хук -stop шлёт nil */
     if (t != NULL && g_run == t->run_id) {
-        t->cancel = 1;
-        update_controls();
-        status_rnd(t);
+        r = drnd_of(t);
+        if (r != NULL) {
+            r->cancel = 1;
+            update_controls();
+            status_rnd(t);
+        }
     }
 }
 
@@ -2000,27 +2029,23 @@ static void sm_poll(void)
 - (void)devChanged:(id)s
 {
     NSString *title = [s titleOfSelectedItem];
-    rndtab   *t = rndtab_of(s);
-    char      path[64];
+    char      nm[16];
 
     if (title == nil)
         return;
-    title_to_path(title, path, sizeof path);
-    if (path[0] != '/')
-        return;
-    if (t == NULL) {
-        strcpy(g_lin_sel, path);
-        lin_sel_changed();
-    } else {
-        strcpy(t->sel, path);
-        rnd_sel_changed(t);
-    }
+    /* пункт "disk0 - ST360021A, 55.9 GB" -> имя диска "disk0" */
+    title_to_disk([title UTF8String], nm, sizeof nm);
+    if (strncmp(nm, "disk", 4) != 0)
+        return;                     /* пункт-заглушка "(опрос...)" */
+    snprintf(g_dd_sel, sizeof g_dd_sel, "%s", nm);
+    dd_select();
 }
 
 - (void)appActive:(NSNotification *)n
 {
     (void)n;
-    refresh_devs();
+    /* горячее подключение/уход диска: пересканировать опросником */
+    sm_refresh();
 }
 
 - (void)smRefresh:(id)s
@@ -2029,19 +2054,10 @@ static void sm_poll(void)
     sm_refresh();
 }
 
-- (void)smDevChanged:(id)s
-{
-    int i = (int)[s indexOfSelectedItem];
-    if (i >= 0 && i < g_sm_ui_n) {
-        snprintf(g_sm_sel, sizeof g_sm_sel, "%s", g_sm_ui[i].name);
-        sm_show();
-    }
-}
-
 /* таблица SMART: data source / delegate (API 10.0) */
 - (int)numberOfRowsInTableView:(NSTableView *)tv
 {
-    const sm_disk *d = sm_find(g_sm_sel);
+    const sm_disk *d = sm_find(g_dd_sel);
     (void)tv;
     return (d != NULL && d->have_data) ? d->nattr : 0;
 }
@@ -2049,7 +2065,7 @@ static void sm_poll(void)
 - (id)tableView:(NSTableView *)tv objectValueForTableColumn:(NSTableColumn *)col
             row:(int)row
 {
-    const sm_disk *d = sm_find(g_sm_sel);
+    const sm_disk *d = sm_find(g_dd_sel);
     const sm_attr *a;
     NSString      *cid = [col identifier];
     char           b[256];
@@ -2082,7 +2098,7 @@ static void sm_poll(void)
 - (void)tableView:(NSTableView *)tv willDisplayCell:(id)cell
    forTableColumn:(NSTableColumn *)col row:(int)row
 {
-    const sm_disk *d = sm_find(g_sm_sel);
+    const sm_disk *d = sm_find(g_dd_sel);
     int            lv = SM_LV_OK;
 
     (void)tv;
@@ -2131,9 +2147,9 @@ static void sm_poll(void)
     rt = rndtab_of_run(g_run);
     pthread_mutex_lock(&g_lock);
     if (g_run == RUN_LIN)
-        done = g_lin_done;
-    else if (rt != NULL)
-        done = rt->done;
+        done = (g_cur != NULL) ? g_cur->lin.done : 1;
+    else if (rt != NULL && rt->dd != NULL)
+        done = drnd_of(rt)->done;
     pthread_mutex_unlock(&g_lock);
 
     rnd_stats_update(&g_acc);
@@ -2163,6 +2179,23 @@ static void sm_poll(void)
             [self rndStop:nil];
     }
 
+    if (g_snap_at > 0 && time(NULL) >= g_snap_at) {
+        g_snap_at = 0;
+        {
+            NSView *cv = [g_win contentView];
+            NSData *pdf = [cv dataWithPDFInsideRect:[cv bounds]];
+
+            if (pdf != nil && [pdf writeToFile:@"/tmp/diskgraph-snap.pdf"
+                                    atomically:YES]) {
+                printf("snap: /tmp/diskgraph-snap.pdf written\n");
+                fflush(stdout);
+            } else {
+                printf("snap: FAILED\n");
+                fflush(stdout);
+            }
+        }
+    }
+
     if (g_close_at > 0 && time(NULL) >= g_close_at) {
         g_close_at = 0;
         printf("close: performClose\n");
@@ -2185,7 +2218,8 @@ static void sm_poll(void)
             [g_tabs selectTabViewItemAtIndex:nxt];
             pthread_mutex_lock(&g_lock);
             printf("cycle: tab %d -> %d   lin_n %d   acc_n %d   seek_n %d\n",
-                   cur, nxt, g_lin.n, g_acc.pts.n, g_seek.pts.n);
+                   cur, nxt, g_cur->lin.pts.n, g_cur->acc.pts.n,
+                   g_cur->seek.pts.n);
             fflush(stdout);
             pthread_mutex_unlock(&g_lock);
         }
@@ -2212,15 +2246,17 @@ static void sm_poll(void)
     int     i, done = 1;
 
     (void)n;
-    g_lin_cancel = 1;
-    g_acc.cancel = 1;
-    g_seek.cancel = 1;
+    if (g_cur != NULL) {
+        g_cur->lin.cancel = 1;
+        g_cur->acc.cancel = 1;
+        g_cur->seek.cancel = 1;
+    }
     for (i = 0; i < 20; i++) {
         pthread_mutex_lock(&g_lock);
         if (g_run == RUN_LIN)
-            done = g_lin_done;
-        else if (rt != NULL)
-            done = rt->done;
+            done = (g_cur != NULL) ? g_cur->lin.done : 1;
+        else if (rt != NULL && rt->dd != NULL)
+            done = drnd_of(rt)->done;
         pthread_mutex_unlock(&g_lock);
         if (done)
             break;
@@ -2271,12 +2307,10 @@ static NSButton *make_button(NSView *v, Controller *ctl, const char *title,
     return [b autorelease];
 }
 
-static const char *k_tip_dev =
-    "Устройство для замера.\n"
-    "/dev/rdiskN - raw-нода: чтение идёт прямо с диска, запросами "
-    "нашего размера. Для замера - только она.\n"
-    "/dev/diskN (buffered) - блочная нода: через кеш ядра порциями по "
-    "4 KB, F_NOCACHE на неё не действует. Только для сравнения.";
+static const char *k_tip_dd =
+    "Выбор диска для всех вкладок сразу. Замер всегда идёт по raw-ноде\n"
+    "/dev/rdiskN выбранного диска: чтение прямо с диска, без кеша ядра.\n"
+    " Один прогон одновременно; во время прогона выбор заблокирован.";
 
 /* что даёт вкладка и как выглядит норма - серая строка под контролами */
 static const char *k_desc_seq =
@@ -2298,10 +2332,12 @@ static const char *k_desc_smart =
 
 #define DESC_H 30.0f                /* две строки по 11 pt */
 
-static void make_desc(NSView *v, NSSize sz, const char *txt)
+/* серая строка описания; top - посадка верхнего края: на вкладках
+ * замеров 44 (под рядом контролей), на SMART - плотнее */
+static void make_desc(NSView *v, NSSize sz, const char *txt, float top)
 {
     NSTextField *t = [[NSTextField alloc] initWithFrame:
-        NSMakeRect(14.0f, sz.height - 44.0f - DESC_H, sz.width - 28.0f,
+        NSMakeRect(14.0f, sz.height - top - DESC_H, sz.width - 28.0f,
                    DESC_H)];
     [t setStringValue:u8(txt)];
     [t setFont:[NSFont systemFontOfSize:11.0f]];
@@ -2326,26 +2362,17 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
     float          h = sz.height, w = sz.width;
     float          y = h - 36.0f;
     int            lin = (t == NULL);
-    NSPopUpButton *pop;
     NSSlider      *sl;
     NSTextField   *val, *st;
     NSView        *gv;
     NSButton      *bstart, *bstop;
     char           lbl[32];
+    /* у вкладок своего селектора диска нет: замер идёт по /dev/rdiskN
+     * диска, выбранного в шапке */
 
-    make_label(v, "Диск:", 10.0f, y + 4.0f, 40.0f, 1);
-    pop = [[NSPopUpButton alloc]
-        initWithFrame:NSMakeRect(54.0f, y - 1.0f, 186.0f, 26.0f) pullsDown:NO];
-    [pop setTarget:ctl];
-    [pop setAction:@selector(devChanged:)];
-    [pop setAutoresizingMask:NSViewMinYMargin];
-    tip(pop, k_tip_dev);
-    [v addSubview:pop];
-    [pop release];
-
-    make_label(v, lin ? "Duty:" : "Время:", 248.0f, y + 4.0f, 52.0f, 1);
+    make_label(v, lin ? "Duty:" : "Время:", 14.0f, y + 4.0f, 52.0f, 1);
     sl = [[NSSlider alloc] initWithFrame:
-        NSMakeRect(306.0f, y + 1.0f, 170.0f, 22.0f)];
+        NSMakeRect(70.0f, y + 1.0f, 170.0f, 22.0f)];
     [sl setMinValue:lin ? 1.0 : 5.0];
     [sl setMaxValue:lin ? 100.0 : 120.0];
     [sl setIntValue:lin ? g_duty : t->secs];
@@ -2363,7 +2390,7 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
         snprintf(lbl, sizeof lbl, "%d %%", g_duty);
     else
         snprintf(lbl, sizeof lbl, "%d с", t->secs);
-    val = make_label(v, lbl, 482.0f, y + 4.0f, 60.0f, 0);
+    val = make_label(v, lbl, 246.0f, y + 4.0f, 60.0f, 0);
     [val setFont:[NSFont boldSystemFontOfSize:12.0f]];
 
     st = [[NSTextField alloc]
@@ -2392,10 +2419,11 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
     tip(bstop, "Остановить прогон; уже снятые точки остаются на графике.");
 
     make_desc(v, sz, lin ? k_desc_seq
-                         : (t->mode == DGRND_SEEK ? k_desc_seek : k_desc_acc));
+                         : (t->mode == DGRND_SEEK ? k_desc_seek : k_desc_acc),
+              44.0f);
 
     if (lin) {
-        g_lin_dev = pop; g_lin_slider = sl; g_duty_val = val;
+        g_lin_slider = sl; g_duty_val = val;
         g_lin_status = st; g_lin_view = gv;
         g_lin_start = bstart; g_lin_stop = bstop;
         tip(bstart, "Sequential read: сегменты по 32 MB блоками 1 MB "
@@ -2404,9 +2432,8 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
         tip(gv, "Скорость последовательного чтения (MB/s) по позиции на "
                 "диске.\nПунктир - средняя скорость, красные крестики - "
                 "ошибки чтения (EIO).");
-        fill_dev_popup(pop, g_lin_sel, sizeof g_lin_sel);
     } else {
-        t->dev = pop; t->slider = sl; t->val = val;
+        t->slider = sl; t->val = val;
         t->status = st; t->view = gv;
         t->start = bstart; t->stop = bstop;
         [(RndView *)gv setTab:t];
@@ -2432,7 +2459,6 @@ static NSView *make_tab(Controller *ctl, NSSize sz, rndtab *t)
                     "Красные точки - выше p99, крестики внизу - ошибки "
                     "чтения (EIO).");
         }
-        fill_dev_popup(pop, t->sel, sizeof t->sel);
     }
     return [v autorelease];
 }
@@ -2468,53 +2494,38 @@ static void sm_column(NSTableView *tv, NSString *ident, const char *title,
 }
 
 /*
- * Вкладка SMART: диск + "Обновить", плашка вердикта, паспорт,
- * пояснение находок, таблица атрибутов. Только чтение SMART.
+ * Вкладка SMART: плашка вердикта, паспорт, пояснение находок, таблица
+ * атрибутов. Диск берётся из шапки (g_dd_sel); «Обновить» - в шапке.
+ * Только чтение SMART.
  */
 static NSView *make_smart_tab(Controller *ctl, NSSize sz)
 {
     NSView       *v = [[NSView alloc] initWithFrame:
                            NSMakeRect(0.0f, 0.0f, sz.width, sz.height)];
     float         h = sz.height, w = sz.width;
-    float         y = h - 36.0f;
     NSScrollView *sv;
     NSTableView  *tv;
 
-    make_label(v, "Диск:", 10.0f, y + 4.0f, 40.0f, 1);
-    g_sm_dev = [[NSPopUpButton alloc]
-        initWithFrame:NSMakeRect(54.0f, y - 1.0f, 300.0f, 26.0f) pullsDown:NO];
-    [g_sm_dev setTarget:ctl];
-    [g_sm_dev setAction:@selector(smDevChanged:)];
-    [g_sm_dev setAutoresizingMask:NSViewMinYMargin];
-    [g_sm_dev addItemWithTitle:[NSString stringWithUTF8String:g_sm_sel]];
-    tip(g_sm_dev, "Целые диски. SMART отдают внутренние ATA/SATA-диски; "
-                  "USB/FireWire-мосты и RAID-тома - нет.");
-    [v addSubview:g_sm_dev];
-    [g_sm_dev release];
+    /* стопка: описание 26..56, зазор 12, плашка/паспорт 68..106,
+     * зазор 12, объяснение 118..154, таблица с 162 */
+    make_desc(v, sz, k_desc_smart, 26.0f);
 
-    make_desc(v, sz, k_desc_smart);
-
-    g_sm_refresh = make_button(v, ctl, "Обновить", @selector(smRefresh:),
-                               w - 108.0f, y - 4.0f);
-    tip(g_sm_refresh, "Перечитать SMART всех дисков. Только чтение: "
-                      "статус, атрибуты, пороги - тесты не запускаются.");
-
-    g_sm_verdict = make_text(v, NSMakeRect(14.0f, h - DESC_H - 86.0f, 90.0f, 32.0f),
+    g_sm_verdict = make_text(v, NSMakeRect(14.0f, h - 100.0f, 90.0f, 32.0f),
                              26.0f, 1);
     tip(g_sm_verdict, "OK - критичные счётчики нулевые; WARN - есть "
                       "переназначенные/нечитаемые сектора или CRC-ошибки "
                       "шлейфа; FAIL - pending-сектора или атрибут на пороге.");
-    g_sm_note = make_text(v, NSMakeRect(110.0f, h - DESC_H - 74.0f, w - 124.0f, 18.0f),
+    g_sm_note = make_text(v, NSMakeRect(110.0f, h - 88.0f, w - 124.0f, 18.0f),
                           13.0f, 1);
-    g_sm_ident = make_text(v, NSMakeRect(110.0f, h - DESC_H - 92.0f, w - 124.0f, 17.0f),
+    g_sm_ident = make_text(v, NSMakeRect(110.0f, h - 106.0f, w - 124.0f, 17.0f),
                            11.0f, 0);
-    g_sm_explain = make_text(v, NSMakeRect(14.0f, h - DESC_H - 132.0f, w - 28.0f,
-                                           34.0f), 11.0f, 0);
+    g_sm_explain = make_text(v, NSMakeRect(14.0f, h - 154.0f, w - 28.0f,
+                                           36.0f), 11.0f, 0);
     [g_sm_explain setTextColor:
         [NSColor colorWithCalibratedWhite:0.25f alpha:1.0f]];
 
     sv = [[NSScrollView alloc] initWithFrame:
-        NSMakeRect(8.0f, 8.0f, w - 16.0f, h - 146.0f - DESC_H)];
+        NSMakeRect(8.0f, 8.0f, w - 16.0f, h - 170.0f)];
     [sv setHasVerticalScroller:YES];
     if ([sv respondsToSelector:@selector(setAutohidesScrollers:)])
         [sv setAutohidesScrollers:YES];         /* 10.3+ */
@@ -2665,11 +2676,21 @@ int main(int argc, char *argv[])
     NSSize         csz;
     int            sized = 0, i;
 
-    /* -devs: только список дисков, без окна и без прав */
+    /* -devs: список дисков из реестра, без окна и без прав */
     if (has_arg(argc, argv, "-devs")) {
-        NSArray *dl = scan_disks();
-        for (i = 0; i < (int)[dl count]; i++)
-            printf("%s\n", [[dl objectAtIndex:i] UTF8String]);
+        char names[SM_MAX][16];
+        int  n = sm_scan(names, SM_MAX);
+
+        for (i = 0; i < n; i++) {
+            sm_disk d;
+            sm_probe(names[i], &d);
+            printf("%s   %s   %.1f GB   %s", d.name,
+                   d.model[0] ? d.model : "-",
+                   (double)d.bytes / GIB, sm_verdict_str(d.vd));
+            if (d.bus[0])
+                printf("  %s", d.bus);
+            printf("\n");
+        }
         [pool release];
         return 0;
     }
@@ -2738,14 +2759,41 @@ int main(int argc, char *argv[])
              defer:NO];
     [win setTitle:[NSString stringWithUTF8String:"DiskGraph"]];
     g_win = win;
-    [win setMinSize:NSMakeSize(840.0f, 520.0f)];
+    [win setMinSize:NSMakeSize(840.0f, 550.0f)];
     root = [[[NSView alloc] initWithFrame:rc] autorelease];
     [root setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win setContentView:root];
 
-    /* вкладки с отступом от краёв окна - как в системных панелях */
+    /* шапка над вкладками: глобальный выбор диска + Обновить.
+     * Диск один на все вкладки; отдельный прогон - тоже один */
+    {
+        NSRect rb = [root bounds];
+
+        make_label(root, "Диск:", 10.0f, rb.size.height - 27.0f, 40.0f, 1);
+        g_dd_dev = [[NSPopUpButton alloc]
+            initWithFrame:NSMakeRect(54.0f, rb.size.height - 31.0f,
+                                     320.0f, 26.0f) pullsDown:NO];
+        [g_dd_dev setTarget:ctl];
+        [g_dd_dev setAction:@selector(devChanged:)];
+        [g_dd_dev setAutoresizingMask:NSViewMinYMargin];
+        tip(g_dd_dev, k_tip_dd);
+        [root addSubview:g_dd_dev];
+        [g_dd_dev release];
+
+        g_sm_refresh = make_button(root, ctl, "Обновить",
+                                   @selector(smRefresh:),
+                                   rb.size.width - 108.0f,
+                                   rb.size.height - 34.0f);
+        tip(g_sm_refresh, "Пересканировать диски и перечитать SMART "
+                          "всех дисков. Только чтение: статус, атрибуты, "
+                          "пороги - тесты не запускаются.");
+    }
+
+    /* вкладки с отступом от краёв окна и под шапкой */
     g_tabs = [[NSTabView alloc] initWithFrame:
-                 NSInsetRect([root bounds], 8.0f, 6.0f)];
+                 NSMakeRect(8.0f, 6.0f,
+                            [root bounds].size.width - 16.0f,
+                            [root bounds].size.height - 44.0f)];
     [g_tabs setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [root addSubview:g_tabs];
 
@@ -2759,24 +2807,25 @@ int main(int argc, char *argv[])
     [g_tabs addTabViewItem:g_sm_tab];
     [ctl windowDidResize:nil];
 
-    g_lin_selcap  = dg_probe_capacity(g_lin_sel);
-    g_acc.selcap  = dg_probe_capacity(g_acc.sel);
-    g_seek.selcap = dg_probe_capacity(g_seek.sel);
+    /* выбор диска: пока смарт-опрос не отработал, в шапке заглушка;
+     * после первого поколения список появится, выбор сохранится */
+    dd_repopulate();
+    dd_select();
     update_controls();
     status_all();
     sm_refresh();                   /* SMART всех дисков - фоном */
 
-    /* dev-хуки: -ldev/-adev/-sdev PATH - диск вкладки; -lin/-acc/-seek
-     * стартуют реальный прогон; -cycle щёлкает вкладки и печатает
-     * счётчики */
+    /* dev-хуки: -dev diskN (или rdiskN) - выбрать диск для всех вкладок;
+     * -lin/-acc/-seek стартуют реальный прогон; -cycle щёлкает вкладки
+     * и печатает счётчики выбранного диска */
     for (i = 1; i + 1 < argc; i++) {
-        rndtab *t = NULL;
-        if (strcmp(argv[i], "-ldev") == 0) {
-            strncpy(g_lin_sel, argv[i + 1], sizeof g_lin_sel - 1);
-            fill_dev_popup(g_lin_dev, g_lin_sel, sizeof g_lin_sel);
-            lin_sel_changed();
-        } else if (strcmp(argv[i], "-adev") == 0) {
-            t = &g_acc;
+        if (strcmp(argv[i], "-dev") == 0) {
+            char nm[16];
+            /* rdisk1 -> disk1: обе проекции - один диск */
+            dev_to_disk(argv[i + 1], nm, sizeof nm);
+            snprintf(g_dd_sel, sizeof g_dd_sel, "%s", nm);
+            dd_repopulate();
+            dd_select();
         } else if (strcmp(argv[i], "-duty") == 0) {
             char lbl[16];
             g_duty = atoi(argv[i + 1]);
@@ -2785,15 +2834,6 @@ int main(int argc, char *argv[])
             [g_lin_slider setIntValue:g_duty];
             snprintf(lbl, sizeof lbl, "%d %%", g_duty);
             [g_duty_val setStringValue:u8(lbl)];
-        } else if (strcmp(argv[i], "-smdev") == 0) {
-            snprintf(g_sm_sel, sizeof g_sm_sel, "%s", argv[i + 1]);
-        } else if (strcmp(argv[i], "-sdev") == 0) {
-            t = &g_seek;
-        }
-        if (t != NULL) {
-            strncpy(t->sel, argv[i + 1], sizeof t->sel - 1);
-            fill_dev_popup(t->dev, t->sel, sizeof t->sel);
-            rnd_sel_changed(t);
         }
     }
     for (i = 1; i < argc; i++) {
@@ -2816,6 +2856,9 @@ int main(int argc, char *argv[])
             i++;
         } else if (strcmp(argv[i], "-close") == 0 && i + 1 < argc) {
             g_close_at = time(NULL) + atoi(argv[i + 1]);
+            i++;
+        } else if (strcmp(argv[i], "-snap") == 0 && i + 1 < argc) {
+            g_snap_at = time(NULL) + atoi(argv[i + 1]);
             i++;
         } else if (strcmp(argv[i], "-again") == 0) {
             g_again = 1;
